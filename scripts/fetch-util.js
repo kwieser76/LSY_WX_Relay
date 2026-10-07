@@ -36,8 +36,9 @@ async function getText(url, opts) {
         lastErr = 'HTTP ' + res.status;
         lastStatus = res.status;
         lastRetryAfter = res.headers && typeof res.headers.get === 'function' ? res.headers.get('retry-after') : null;
-        // A 4xx other than rate limiting will not get better on a retry.
-        if (res.status >= 400 && res.status < 500 && res.status !== 429) break;
+        // A 4xx will not get better on a retry — and 403/429 mean "leave this host alone" (PO rule;
+        // until 2026-10-07 a 429 was retried after 2 s).
+        if (res.status >= 400 && res.status < 500) break;
         continue;
       }
       return await res.text();
