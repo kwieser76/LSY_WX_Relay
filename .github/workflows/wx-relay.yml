@@ -1,8 +1,13 @@
-# Recomputes the week-ahead forecast file latest.json four times a day, after the GFS cycles, and
-# publishes it on the branch "data" as a single commit (force-pushed, so the repository does not grow):
+# Recomputes latest.json (the week ahead, today's NAT tracks, the observed weather of the week so far) four
+# times a day, after the GFS cycles, and publishes it on the branch "data" as a single commit (force-pushed, so
+# the repository does not grow):
 #   https://raw.githubusercontent.com/<owner>/<repo>/data/latest.json
+# The same commit carries cache/lightning-<week>.json and cache/mrms-<week>.json: the hours of lightning and
+# radar data already read this week, so the next run downloads only the new hours. The run restores them from
+# the data branch first; a missing or broken cache only means starting fresh, and a new week's run publishes no
+# cache of the old week.
 # relay.js exits 1 without writing when every part failed or the privacy check finds something; the
-# publish step then does not run and the previous latest.json stays in place.
+# publish step then does not run and the previous latest.json and caches stay in place.
 name: WX relay
 
 on:
@@ -20,7 +25,7 @@ concurrency:
 jobs:
   relay:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 40
     steps:
       - name: Check out main
         uses: actions/checkout@v4
@@ -32,20 +37,37 @@ jobs:
         with:
           node-version: "20"
 
-      - name: Fetch the week ahead and write out/latest.json
-        run: node relay.js --out out
+      - name: Restore the caches of the observed weather from the data branch (none = start fresh)
+        run: |
+          mkdir -p "$RUNNER_TEMP/cache"
+          if git fetch -q --depth=1 origin data 2>/dev/null; then
+            for f in $(git ls-tree --name-only FETCH_HEAD cache/ 2>/dev/null); do
+              git show "FETCH_HEAD:$f" > "$RUNNER_TEMP/cache/$(basename "$f")" || rm -f "$RUNNER_TEMP/cache/$(basename "$f")"
+            done
+          fi
+          ls -l "$RUNNER_TEMP/cache"
+
+      - name: Fetch the data and write out/latest.json and out/cache/
+        run: node relay.js --out out --cache "$RUNNER_TEMP/cache"
 
       - name: Privacy check of the output
-        run: node privacy-check.js out/latest.json
+        run: node privacy-check.js out/latest.json $(ls -d out/cache 2>/dev/null)
 
-      - name: Publish latest.json to the data branch (one orphan commit, force-pushed)
+      - name: Publish latest.json and the caches to the data branch (one orphan commit, force-pushed)
         run: |
           set -euo pipefail
           cp out/latest.json "$RUNNER_TEMP/latest.json"
+          mkdir -p "$RUNNER_TEMP/publish-cache"
+          if [ -d out/cache ]; then cp out/cache/*.json "$RUNNER_TEMP/publish-cache/" 2>/dev/null || true; fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git switch --orphan data-publish
           cp "$RUNNER_TEMP/latest.json" latest.json
           git add latest.json
+          if ls "$RUNNER_TEMP"/publish-cache/*.json >/dev/null 2>&1; then
+            mkdir -p cache
+            cp "$RUNNER_TEMP"/publish-cache/*.json cache/
+            git add cache
+          fi
           git commit -q -m "latest.json $(date -u +%Y-%m-%dT%H:%MZ)"
           git push --force origin HEAD:refs/heads/data

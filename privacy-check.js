@@ -11,8 +11,11 @@
 // Built-in rules (always on):
 //   email        any e-mail address except the GitHub noreply addresses the workflow commits with
 //   local path   a user home folder (macOS, Linux, Windows) or a synced cloud-drive folder
-//   hub arrays   in JSON: a "hubs" or "hubProb" array with content, or any array of objects that pairs an
-//                airport code ("code"/"icao") with a position ("lat"/"lon")
+//   hub arrays   in JSON: a "hubs" or "hubProb" array or object with content, or any array of objects that pairs
+//                an airport code ("code"/"icao") with a position ("lat"/"lon")
+//   report text  in JSON string values: the text of a SIGMET (ICAO "XXXX SIGMET … VALID ddhhmm/ddhhmm" or a US
+//                "CONVECTIVE SIGMET 12E"), a pilot report ("UA /OV …") or a METAR/SPECI — the relay publishes
+//                reduced grids and counts, never the messages themselves (several are third-party content)
 // Extra terms (--terms, or privacy-terms.js next to this file when it exists; neither is published):
 //   { words: [..] }            any hit fails
 //   { names: [..] }            any hit fails (case-insensitive, whole words)
@@ -68,10 +71,17 @@ function checkText(name, text, terms) {
   return F;
 }
 
-// JSON structure rules: hub arrays with content, airport-code + position tables.
+// JSON structure rules: hub arrays with content, airport-code + position tables, raw report texts.
+const REPORT_TEXT = [/\b[A-Z]{4} SIGMET\s+[A-Z0-9]{1,4}\s*\d{0,3}\s+VALID\s+\d{6}\/\d{6}/, /\bCONVECTIVE SIGMET\s+\d{1,3}[ECW]\b/,
+                     /\bU?UA\s+\/OV\b/, /\b(METAR|SPECI)\s+[A-Z]{4}\s+\d{6}Z\b/];
 function checkJson(name, obj) {
   const F = [];
   (function walk(v, p) {
+    if (typeof v === 'string') {
+      const re = REPORT_TEXT.find(r => r.test(v));
+      if (re) F.push({ file: name, rule: 'report text (SIGMET / PIREP / METAR)', text: p, at: v.slice(0, 90), fatal: true });
+      return;
+    }
     if (Array.isArray(v)) {
       if (v.length && v.some(x => x && typeof x === 'object' && !Array.isArray(x) && ('code' in x || 'icao' in x) && ('lat' in x || 'lon' in x)))
         F.push({ file: name, rule: 'airport table (code + position)', text: p + ' [' + v.length + ']', at: JSON.stringify(v[0]).slice(0, 90), fatal: true });
@@ -80,6 +90,8 @@ function checkJson(name, obj) {
       Object.keys(v).forEach(k => {
         if ((k === 'hubs' || k === 'hubProb') && Array.isArray(v[k]) && v[k].length)
           F.push({ file: name, rule: 'hub array with content', text: p + '.' + k + ' [' + v[k].length + ']', at: JSON.stringify(v[k]).slice(0, 90), fatal: true });
+        else if ((k === 'hubs' || k === 'hubProb') && v[k] && typeof v[k] === 'object' && !Array.isArray(v[k]) && Object.keys(v[k]).length)
+          F.push({ file: name, rule: 'hub table with content', text: p + '.' + k + ' {' + Object.keys(v[k]).slice(0, 4).join(', ') + '}', at: JSON.stringify(v[k]).slice(0, 90), fatal: true });
         walk(v[k], p + '.' + k);
       });
     }
@@ -119,7 +131,7 @@ function report(F, nFiles, withTerms) {
   return bad;
 }
 
-module.exports = { checkText, checkJson, checkFiles, loadTerms, report, LIST_MIN };
+module.exports = { checkText, checkJson, checkFiles, loadTerms, report, LIST_MIN, REPORT_TEXT };
 
 if (require.main === module) {
   const a = process.argv.slice(2), ti = a.indexOf('--terms');
