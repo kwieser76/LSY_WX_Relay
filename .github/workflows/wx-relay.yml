@@ -1,0 +1,51 @@
+# Recomputes the week-ahead forecast file latest.json four times a day, after the GFS cycles, and
+# publishes it on the branch "data" as a single commit (force-pushed, so the repository does not grow):
+#   https://raw.githubusercontent.com/<owner>/<repo>/data/latest.json
+# relay.js exits 1 without writing when every part failed or the privacy check finds something; the
+# publish step then does not run and the previous latest.json stays in place.
+name: WX relay
+
+on:
+  schedule:
+    - cron: "30 4,10,16,22 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: wx-relay
+  cancel-in-progress: false
+
+jobs:
+  relay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Check out main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Set up Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Fetch the week ahead and write out/latest.json
+        run: node relay.js --out out
+
+      - name: Privacy check of the output
+        run: node privacy-check.js out/latest.json
+
+      - name: Publish latest.json to the data branch (one orphan commit, force-pushed)
+        run: |
+          set -euo pipefail
+          cp out/latest.json "$RUNNER_TEMP/latest.json"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch --orphan data-publish
+          cp "$RUNNER_TEMP/latest.json" latest.json
+          git add latest.json
+          git commit -q -m "latest.json $(date -u +%Y-%m-%dT%H:%MZ)"
+          git push --force origin HEAD:refs/heads/data

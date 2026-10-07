@@ -1,0 +1,6 @@
+{
+  "_comment": "Settings read by scripts/. Only fetch-sigwx-model.js reads this file: sigwxModel.catCalibration \"fixed\" (the literature thresholds 8 and 12 x 1e-7 s^-2) or \"percentile\".",
+  "sigwxModel": {
+    "catCalibration": "fixed"
+  }
+}
