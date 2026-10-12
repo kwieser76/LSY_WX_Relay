@@ -1,6 +1,11 @@
 {
-  "_comment": "Settings read by scripts/. Only fetch-sigwx-model.js reads this file: sigwxModel.catCalibration \"fixed\" (the literature thresholds 8 and 12 x 1e-7 s^-2) or \"percentile\".",
+  "_comment": "Settings read by scripts/. fetch-sigwx-model.js: sigwxModel.catCalibration \"fixed\" (the literature thresholds 8 and 12 x 1e-7 s^-2) or \"percentile\". fetch-natarchive.js: natArchive, the public GitHub repository with the captured North Atlantic track messages.",
   "sigwxModel": {
     "catCalibration": "fixed"
+  },
+  "natArchive": {
+    "repo": "kwieser76/LSY_NAT_Track",
+    "branch": "Redline-main",
+    "visibility": "public"
   }
 }

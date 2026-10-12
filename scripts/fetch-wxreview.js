@@ -120,6 +120,37 @@ function archiveRanges(idxText, wanted) {
   });
   return out;
 }
+// One day's GFS analysis (f000, 00Z) at the jet levels asked for, with the flight-level fields: the NOMADS grib filter,
+// else the same messages from the archive on AWS. req(url, fn) is the caller's pacing and counting wrapper. Returns
+// { item: { valid, grids, areas }, levels: the Europe/NAT flight-level grids or null, archived }; throws when neither
+// source has the day. Shared by fetchWxReview (300/250/200 hPa) and fetchGfsObserved (250 hPa only, the relay).
+async function readGfsDay(d, levels, req) {
+  let b = null, nomadsErr = null, archived = false;
+  try {
+    const url = gfsAnalysisUrl(d, levels, true);
+    b = await req(url, () => WX.getBuffer(url, { timeoutMs: TIMEOUT_MS.gfs }));
+    if (!(Buffer.isBuffer(b) && b.toString('latin1', 0, 4) === 'GRIB')) throw new Error('no GRIB in the answer (cycle no longer on the server?)');
+  } catch (e) {
+    // NOMADS no longer has the day (or is down): the same analysis from NOAA's archive on AWS.
+    nomadsErr = e; b = null;
+    try {
+      const file = gfsArchiveFile(d);
+      const idx = await req(file + '.idx', () => U.getText(file + '.idx', { retries: 0 }));
+      const ranges = archiveRanges(idx, archiveWanted(levels));
+      if (!ranges.length) throw new Error('inventory lists none of the fields');
+      const parts = [];
+      for (const r of ranges) parts.push(await req(file, () => WX.getRange(file, r.offset, r.length, { timeoutMs: TIMEOUT_MS.gfs, retries: 1 })));
+      b = Buffer.concat(parts);
+      archived = true;
+    } catch (e2) {
+      throw new Error('NOMADS: ' + String(nomadsErr.message || nomadsErr).replace(/^https?:\/\/\S+: /, '') + '; archive: ' + String(e2.message || e2).replace(/^https?:\/\/\S+ /, ''));
+    }
+  }
+  const f = WX.pickFields(WX.decodeGrib2(b));
+  const grids = WX.jetGridsOf(f);
+  if (!grids['250']) throw new Error('no 250 hPa u/v in the answer');
+  return { item: { valid: d + 'T00:00:00.000Z', grids, areas: WX.areaGridsOf(f, true) }, levels: WX.levelGridsOf(f), archived };
+}
 // AWC pilot and aircraft reports (PIREP, AIREP), moderate or worse, one call per day over the map frame.
 // bbox is "lat0,lon0,lat1,lon1" (OpenAPI aviationweather.gov/data/schema/openapi.yaml); `date` + `age`
 // select by observation time (checked 2026-10-06: date 1 Oct 00Z, age 24 gave obs 30 Sep 03:04–23:52Z).
@@ -1071,34 +1102,10 @@ async function fetchWxReview({ from, to }) {
       for (const d of daysOf(from, to)) {
         if (Date.parse(d + 'T04:00:00Z') > nowMs) { missing.push(d + ' (not yet published)'); continue; }
         try {
-          let b = null, nomadsErr = null;
-          try {
-            const url = gfsAnalysisUrl(d, WX.JET_LEVELS, true);
-            b = await req(url, () => WX.getBuffer(url, { timeoutMs: TIMEOUT_MS.gfs }));
-            if (!(Buffer.isBuffer(b) && b.toString('latin1', 0, 4) === 'GRIB')) throw new Error('no GRIB in the answer (cycle no longer on the server?)');
-          } catch (e) {
-            // NOMADS no longer has the day (or is down): the same analysis from NOAA's archive on AWS.
-            nomadsErr = e; b = null;
-            try {
-              const file = gfsArchiveFile(d);
-              const idx = await req(file + '.idx', () => U.getText(file + '.idx', { retries: 0 }));
-              const ranges = archiveRanges(idx, archiveWanted(WX.JET_LEVELS));
-              if (!ranges.length) throw new Error('inventory lists none of the fields');
-              const parts = [];
-              for (const r of ranges) parts.push(await req(file, () => WX.getRange(file, r.offset, r.length, { timeoutMs: TIMEOUT_MS.gfs, retries: 1 })));
-              b = Buffer.concat(parts);
-              archived.push(d);
-            } catch (e2) {
-              throw new Error('NOMADS: ' + String(nomadsErr.message || nomadsErr).replace(/^https?:\/\/\S+: /, '') + '; archive: ' + String(e2.message || e2).replace(/^https?:\/\/\S+ /, ''));
-            }
-          }
-          const f = WX.pickFields(WX.decodeGrib2(b));
-          const grids = WX.jetGridsOf(f);
-          if (!grids['250']) throw new Error('no 250 hPa u/v in the answer');
-          const areas = WX.areaGridsOf(f, true);
-          items.push({ valid: d + 'T00:00:00.000Z', grids, areas });
-          const lv = WX.levelGridsOf(f);
-          if (lv) levelItems.push({ valid: d + 'T00:00:00.000Z', grids: lv, areas }); else noLevels.push(d);
+          const r = await readGfsDay(d, WX.JET_LEVELS, req);
+          if (r.archived) archived.push(d);
+          items.push(r.item);
+          if (r.levels) levelItems.push({ valid: r.item.valid, grids: r.levels, areas: r.item.areas }); else noLevels.push(d);
         } catch (e) { missing.push(d + ' (' + clip(String(e.message || e).replace(/^https?:\/\/\S+: /, ''), 60) + ')'); }
       }
       src.days = { planned: daysOf(from, to).length, read: items.length };
@@ -1212,6 +1219,84 @@ async function fetchUsObserved({ from, to, nowMs: nowArg, gapMs }) {
   out.summary = [from + ' .. ' + to + ' · ' + sources.filter(x => x.ok).length + '/' + sources.length + ' sources · ' + (cv ? cv.total + ' US convective SIGMETs · ' : '') +
                  (out.spc ? out.spc.reports.length + ' SPC reports · ' : '') + sumObj(hits) + ' requests · ' + out.seconds + ' s'];
   return out;
+}
+
+// ---- GFS analyses of the days so far (the public relay's "This week", 2026-10-12) --------------------------------
+// The jet at 250 hPa (≈ FL340) and the flight-level grids (tropopause, max-wind level, freezing level) of the 00Z
+// analysis of each day of the window, in all three map frames: the `jet` and `levels` objects of fetchWxReview, built
+// by the same reducers, so the Last-week renderers draw them unchanged (jet.levels = ['250'], byLevel empty: FL300 and
+// FL390 are not requested, to keep the public file small). One request per day as in the weekly run (NOMADS; the
+// archive on AWS when NOMADS does not answer). Nothing international or airport-specific is read.
+// Incremental: cache.prev { kind: 'gfs', version, params, days: { 'YYYY-MM-DD': { valid, grids, levels, areas } } }
+// holds the reduced grids of the days already read (an analysis does not change), so only new days are requested;
+// days outside the window are dropped. A cache of another version or with other grids or levels (params) is dropped.
+//   fetchGfsObserved({ from, to, cache, nowMs, gapMs, softDeadlineS })   nowMs, gapMs: tests only
+const GFS_RELAY_LEVELS = ['250'];
+const GFS_CACHE_VERSION = 1;
+const gfsCacheParams = () => JSON.stringify({ jet: WX.JET_GRID, areas: WX.AREA_JET_GRID, levels: GFS_RELAY_LEVELS, lev: WX.LEVEL_LEVS });
+function readGfsCache(c) {
+  const fresh = why => ({ days: {}, dropped: why });
+  if (c == null) return fresh(null);
+  if (typeof c !== 'object' || c.kind !== 'gfs' || c.version !== GFS_CACHE_VERSION) return fresh('not a GFS cache of version ' + GFS_CACHE_VERSION);
+  if (c.params !== gfsCacheParams()) return fresh('written with other grids or levels');
+  const days = {};
+  for (const [d, x] of Object.entries(c.days || {})) {
+    if (!/^\d{4}-\d\d-\d\d$/.test(d) || !x || typeof x.valid !== 'string' || !x.grids || !x.grids['250'] || typeof x.grids['250'].kt !== 'string') return fresh('day ' + d + ' unreadable');
+    days[d] = x;
+  }
+  return { days, dropped: null };
+}
+async function fetchGfsObserved({ from, to, cache, nowMs: nowArg, gapMs, softDeadlineS }) {
+  const t0 = Date.now(), nowMs = nowArg == null ? Date.now() : nowArg, softS = softDeadlineS != null ? softDeadlineS : SOFT_DEADLINE_S;
+  const notes = [], hits = {}, lastStart = {}, dead = new Map(), missing = [], archived = [];
+  // Paced per host as fetchWxReview does; past the soft deadline, or once the host answered 403/429, nothing is sent.
+  async function req(url, fn) {
+    const h = url.split('/')[2];
+    if (dead.has(h)) throw new Error('skipped — ' + dead.get(h));
+    if ((Date.now() - t0) / 1000 > softS) throw new Error('skipped — time budget (' + softS + ' s) used up');
+    const wait = (lastStart[h] || 0) + (gapMs != null ? gapMs : (GAP_MS[h] || 500)) - Date.now();
+    if (wait > 0) await U.sleep(wait);
+    lastStart[h] = Date.now();
+    hits[h] = (hits[h] || 0) + 1;
+    try { return await fn(); }
+    catch (e) { const b = /HTTP (403|429)\b/.exec(String((e && e.message) || e)); if (b) dead.set(h, h + ' answered ' + b[0] + ' — not asked again'); throw e; }
+  }
+  const prev = cache ? readGfsCache(cache.prev) : { days: {}, dropped: null }, got = {};
+  const only250 = g => ({ '250': g['250'] });
+  let reused = 0;
+  for (const d of daysOf(from, to)) {
+    if (prev.days[d]) { got[d] = prev.days[d]; reused++; continue; }
+    if (Date.parse(d + 'T04:00:00Z') > nowMs) { missing.push(d + ' (not yet published)'); continue; }
+    try {
+      const r = await readGfsDay(d, GFS_RELAY_LEVELS, req), A = r.item.areas, areas = {};
+      Object.keys(A).forEach(a => { areas[a] = { grids: only250(A[a].grids), levels: A[a].levels }; });
+      got[d] = { valid: r.item.valid, grids: only250(r.item.grids), levels: r.levels, areas };
+      if (r.archived) archived.push(d);
+    } catch (e) { missing.push(d + ' (' + clip(String(e.message || e).replace(/^https?:\/\/\S+: /, ''), 60) + ')'); }
+  }
+  const dates = Object.keys(got).sort();
+  if (!dates.length) throw new Error('no analysis read: ' + missing.slice(0, 3).join(', '));
+  const items = dates.map(d => got[d]), levelItems = items.filter(x => x.levels).map(x => ({ valid: x.valid, grids: x.levels, areas: x.areas }));
+  const jet = WX.jetLevels(items, 'GFS analysis', { hourUtc: 0, missing });
+  const aj = WX.areaJetLevels(items, 'GFS analysis', { hourUtc: 0 });
+  if (aj) jet.areas = aj;
+  const levels = WX.levelDays(levelItems, 'GFS 1.0° analysis', { hourUtc: 0 });
+  if (levels) {
+    notes.push(WX.LEVEL_NOTE);
+    const al = WX.areaLevelDays(levelItems, 'GFS 1.0° analysis', { hourUtc: 0 });
+    if (al) levels.areas = al;
+  }
+  if (archived.length) notes.push('GFS analyses of ' + archived.join(', ') + ' read from the NOAA GFS archive on AWS (NOMADS did not answer).');
+  if (missing.length) notes.push('GFS analyses not read — ' + missing.join(', '));
+  const fetched = sumObj(hits);
+  if (cache) {
+    cache.next = { kind: 'gfs', version: GFS_CACHE_VERSION, params: gfsCacheParams(), days: got };
+    cache.info = { reused, fetched, dropped: prev.dropped };
+  }
+  const seconds = Math.round((Date.now() - t0) / 1000);
+  return { pages: { gfs: PAGES.gfs }, model: 'GFS 1.0° analysis, 00Z of each day', jetLevels: GFS_RELAY_LEVELS.slice(), jet, levels, notes,
+           archiveDays: archived, requests: hits, seconds,
+           summary: [from + ' .. ' + to + ' · ' + dates.length + ' analyses (' + reused + ' from the cache) · ' + fetched + ' requests · ' + seconds + ' s'] };
 }
 
 // ---- digest -----------------------------------------------------------------------------------
@@ -1420,7 +1505,8 @@ module.exports = { NAT_FIRS, CENTRAL_FIRS, HUBS, HUB_T, REGION_NAMES, PAGES, SIG
                    aggregateIemSigmets, parseSpcCsv, summarizeSpc, dayRanges, digest,
                    AREA_FIRS, AREA_SIGMET_GRID, COUNT_HAZARDS, FIR_ALIAS, GFS_BOX, hazardOf, ringTouches, areasOf, areaCounts, areaSigmet, parseIemKml, iemConvective,
                    withConvective, iemPirepUrl, iemSev, iemPirepRows, naPirepBlock, NA_PIREP_BOXES, spcPoints, wxCodes, dustHaze, addAreaLayers,
-                   areaSigmetLine, naPirepLine, meHubLine, fetchWxReview, cli, fetchUsObserved, US_ONLY_NOTE };
+                   areaSigmetLine, naPirepLine, meHubLine, fetchWxReview, cli, fetchUsObserved, US_ONLY_NOTE,
+                   readGfsDay, fetchGfsObserved, readGfsCache, gfsCacheParams, GFS_RELAY_LEVELS };
 // The command line: U.main, then the snapshot rewritten without indentation (see compactSnapshot in fetch-wxoutlook.js).
 function cli() {
   const week = U.cli(process.argv).week;

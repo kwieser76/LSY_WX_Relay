@@ -3,7 +3,9 @@
 A small scheduled job that fetches **public weather model and forecast data for the coming seven days**,
 **today's North Atlantic track message** and **the observed weather of the current week so far** (US
 convective SIGMETs, US storm reports, satellite lightning over Europe and the Middle East, US radar storm
-hours) and publishes it as one compact JSON file. A weather map uses that file for an explicit "refresh"
+hours; and, over at least the last three days, the North Atlantic tracks of each day, the GFS jet stream at
+FL340 with tropopause, max-wind and freezing level, and the US weather traffic restrictions) and publishes it
+as one compact JSON file. A weather map uses that file for an explicit "refresh"
 button, so the map can show newer data than it was built with.
 
 > **Not for operational use.** This is model and forecast data, reformatted and partly derived by this
@@ -25,11 +27,14 @@ GitHub Actions, 04:30, 10:30, 16:30 and 22:30 UTC (and on demand)
 
 - `main` holds the code: `relay.js`, the fetchers and decoders in `scripts/` (Node 20, no
   dependencies), `config.json`, `privacy-check.js` and the workflow `.github/workflows/wx-relay.yml`.
-- `data` holds `latest.json` and `cache/lightning-<week>.json`, `cache/mrms-<week>.json`. Every run
-  replaces the branch with a single new commit, so the repository does not grow and the URL always points
-  at the newest file. The caches hold the lightning frames and radar hours of the current ISO week that
-  earlier runs already read (reduced to 0.5° cells), so a run downloads only the new hours; they are
-  dropped when the week changes, and a missing or broken cache only means that run starts fresh.
+- `data` holds `latest.json` and `cache/lightning-<week>.json`, `cache/mrms-<week>.json`, `cache/gfs.json`,
+  `cache/faa.json`. Every run replaces the branch with a single new commit, so the repository does not grow
+  and the URL always points at the newest file. The caches hold what earlier runs already read: the
+  lightning frames and radar hours of the current ISO week (reduced to 0.5° cells), the reduced GFS analyses
+  of the last days, and per FAA advisory (keyed by day and advisory number) the cause, period and airport
+  position it gave. A run downloads only what is new; the week caches are dropped when the week changes,
+  `gfs.json` and `faa.json` keep the days of the current window only, and a missing or broken cache only
+  means that run starts fresh.
 - A run that fails completely (every source failed, or the privacy check found something) publishes
   nothing; the previous `latest.json` stays. A single source that fails becomes `null` in the file, with
   the reason in `status`.
@@ -53,10 +58,13 @@ GitHub Actions, 04:30, 10:30, 16:30 and 22:30 UTC (and on demand)
 | `parts.gefscat` | ensemble CAT probability, days 3–7: the share of the 31 GEFS members whose Ellrod index shows CAT potential |
 | `parts.dust` | dust optical depth classes from GEFS-Aerosols, 5 days |
 | `parts.nat` | today's North Atlantic track message: `{ fetchedAt, page, sets }`, one set per direction with its tracks (route, entry, latitude at 30/40/50W), TMI, split and remarks |
-| `parts.since` | the observed weather of the current ISO week, Monday 00Z to the run: `{ window {from, to, asOf, week}, wxreview, lightning, mrms }` (each null when it failed) |
+| `parts.since` | the observed weather of the current ISO week, Monday 00Z to the run: `{ window {from, to, asOf, week}, wxreview, lightning, mrms, nat, gfs, faa }` (each null when it failed; `nat`, `gfs` and `faa` have a window of their own, see below) |
 | `parts.since.wxreview` | US convective SIGMETs (counts, and a 1° grid over North America of how often a cell lay inside one at the 3-hourly sample moments) and SPC storm reports (per day and as points). Nothing else: no international SIGMETs, no pilot reports, no airport observations |
 | `parts.since.lightning` | EUMETSAT MTG Lightning Imager: per day and 0.5° cell the hours whose sampled frame (one 5-minute frame per hour) showed lightning, Europe/North Atlantic and the Middle East |
 | `parts.since.mrms` | NOAA MRMS: per day and 0.5° cell the hours with radar reflectivity ≥ 40 dBZ, and the day's radar-estimated hail, US |
+| `parts.since.nat` | the North Atlantic tracks of every day of its window, both directions, with entry and exit points |
+| `parts.since.gfs` | GFS 00Z analyses of every day of its window: jet at 250 hPa (FL340), tropopause, max-wind and freezing level, three map frames |
+| `parts.since.faa` | FAA Command Center weather restrictions per day and ARTCC; airports with weather programs as positions (no codes, no names) |
 | `status.<part>` | `{ ok, error?, seconds, requests, megabytes, hosts }`; the since sub-parts as `status["since.lightning"]` etc., with `cache { reused, fetched }` |
 | `attribution` | the credit lines below; show them with the data |
 | `disclaimer` | the "not for operational use" text |
@@ -64,6 +72,38 @@ GitHub Actions, 04:30, 10:30, 16:30 and 22:30 UTC (and on demand)
 Each part keeps its own model run, issue and valid times, label, attribution and notes. Grids are
 base64 or run-length encoded as described inside each part. There are no airport-specific values in this
 file.
+
+### The last days: `since.nat`, `since.gfs`, `since.faa` (added 2026-10-12, schema unchanged)
+
+A reader that knows only the parts above ignores these three; the schema name stays `lsy-wx-relay/1`.
+
+- **Window.** Each of the three has `window { from, to, week, asOf, weekFrom, beforeWeek }`: `to` is the
+  run's day, `weekFrom` the Monday of the ISO week (= `since.window.from`), `from` the Monday or `to − 2`,
+  whichever is earlier, so the window never holds fewer than three days. `beforeWeek` lists the dates before
+  the Monday (Monday: Saturday and Sunday; Tuesday: Sunday; otherwise `[]`). Dates are UTC.
+- **`since.nat`** `{ configured, coordsEncoding, source { repo, branch, page, faa, capture }, days, missingDays,
+  notes }`. `days[]`: `{ date, eastbound?, westbound? }`, only days with a set; the date is the UTC date the
+  set's validity starts (eastbound Gander set 01–08Z, westbound Shanwick set 11:30–19Z). A set: `{ icao,
+  from, to, tmi, north, south, splits[], remarks[], capturedAt, tracks[] }`; a track: `{ letter, route,
+  coords, entry, exit, lat30 }`, `coords` = `"lat,lon lat,lon …"` (south and west negative), `entry` / `exit`
+  = the named points before the first and after the last coordinate. `missingDays[]`: `{ date, missing:
+  ['eastbound' | 'westbound'] }`.
+- **`since.gfs`** `{ model, jetLevels: ['250'], jet, levels, archiveDays, notes }`. `jet` and `levels` have the
+  shape of the weekly review's GFS layers: `jet { res, lat0, lon0, nlat, nlon, encoding: 'base64-uint8',
+  levels: ['250'], byLevel: {}, days [{ date, valid, kt }], max [{ date, kt, lat, lon }], missing, areas { na,
+  me } }`, knots at grid point `lat0 + j·res`, `lon0 + i·res` = byte `j·nlon + i` of `kt`; `levels { …same
+  grid, days [{ date, valid, trop, maxw, frz }], ranges, label, method, areas { na, me } }`, flight level =
+  byte × 5, 0 = missing, `frz` 1 = at or near the surface. Top level = Europe/North Atlantic (25–75N, 80W–40E),
+  `areas.na` 14–72N 170W–50W, `areas.me` 4–46N 14E–82E, all 2°. A day whose 00Z analysis is not out yet
+  (before about 04Z) is missing and named in `notes`.
+- **`since.faa`** `{ source, licence, attribution, positions, ids, oconus, canada, canadaNote, days, airports,
+  weather, notes }`. `days[]`: `{ date, complete, programs, centers, totals }`; `centers` per ARTCC id
+  (`ZNY` …): `{ wx, programs, gs, gdp, afp, reroutes, swap, closure, rerouteHours?, unverified? }` = the
+  restrictions the Command Center issued for weather; `programs` = weather ground stops and delay programs
+  (airport-days); `complete: false` for today and for a day whose advisory pages are not all read yet.
+  `airports[]`: `{ lat, lon, artcc, wxDays, hours, days { date: { gs, gdp, afp, wx: true, hours } } }`, the
+  airports with a weather program, by position only. `weather.days[]`: `{ date, programs }`. Canada: no
+  public data (not the same as no restrictions).
 
 ## Sources and licences
 
@@ -81,6 +121,10 @@ file.
 | NOAA SPC storm reports ([spc.noaa.gov/climo](https://www.spc.noaa.gov/climo/online/)) | tornado, wind and hail reports of the week (preliminary) | public domain |
 | EUMETSAT MTG Lightning Imager, accumulated flash area via EUMETView WMS ([view.eumetsat.int](https://view.eumetsat.int/)) | lightning hours of the week | CC BY 4.0 under the EUMETSAT Data Policy — "Contains modified EUMETSAT Meteosat product <year>" |
 | NOAA MRMS on the NOAA Open Data Dissemination program (noaa-mrms-pds on AWS) | radar storm hours and hail of the week | NOAA open data, attribution requested; modified data, not original NOAA data |
+| North Atlantic track archive ([github.com/kwieser76/LSY_NAT_Track](https://github.com/kwieser76/LSY_NAT_Track)): the FAA NOTAM System track messages, captured twice a day | NAT tracks of the last days | US Government work (public domain) |
+| NOAA GFS 1° analyses (NOMADS; NOAA open data on AWS as fallback) | jet at FL340 and flight levels of the last days | public domain |
+| FAA ATCSCC Advisories Database ([fly.faa.gov](https://www.fly.faa.gov/adv/advAdvisoryForm)) | US weather restrictions of the last days | US Government work (public domain) |
+| OurAirports airports.csv ([ourairports.com/data](https://ourairports.com/data/)) | positions of the airports with FAA weather programs (read at run time, not stored as a table) | public domain |
 
 Credit lines carried in the file:
 
@@ -95,7 +139,10 @@ Credit lines carried in the file:
 - NOAA MRMS radar data via the NOAA Open Data Dissemination program: modified — reduced by this relay to
   hours ≥ 40 dBZ and daily radar-estimated hail per 0.5° cell; not original NOAA data.
 - US convective SIGMETs via the Iowa Environmental Mesonet SIGMET archive; SPC storm reports (preliminary).
-- North Atlantic track message: FAA NOTAM System.
+- North Atlantic track message: FAA NOTAM System; the tracks of the last days as captured in the public
+  archive named in the file.
+- US weather restrictions: FAA Air Traffic Control System Command Center advisories (public domain),
+  reduced to counts per day and ARTCC. Airport positions: OurAirports (public domain).
 
 ## Run it yourself
 
@@ -104,11 +151,15 @@ node relay.js --out out --cache out/cache          # a few minutes; see below fo
 node privacy-check.js out/latest.json out/cache    # exit 1 on a finding
 ```
 
-Options: `--parts wxoutlook,dust,nat,since` (a subset), `--cache DIR` (the caches of the previous run;
+Options: `--parts wxoutlook,dust,nat,since` (a subset; `since.gfs` etc. for single sub-parts), `--cache DIR` (the caches of the previous run;
 without it the observed week starts fresh), `--deny-file FILE` (hosts never to contact, first field of each
 line; a 403/429 is appended), `--allow-host HOST`.
 
 Download per run: the week ahead about 800 requests and 230 MB. The observed week depends on the cache: a
 run with the previous run's cache reads only the hours since then (a few lightning frames and radar files,
 about 20 MB); a run without one reads the whole week so far, capped at 170 lightning frames and 110 radar
-files (about 280 MB) per run — the next run fills the rest.
+files (about 280 MB) per run — the next run fills the rest. The last days' parts add, with the previous
+run's cache, the NAT archive files (about two a day, small, not cached), one FAA list per day, the FAA
+advisories issued since the last run and at most one new GFS analysis. Without a cache, measured for three
+days on 12 Oct 2026: 115 requests and 18 MB (the OurAirports file is 12.7 MB and is read only when an airport
+with a weather program is not placed yet).

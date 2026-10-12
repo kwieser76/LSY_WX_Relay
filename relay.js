@@ -19,17 +19,27 @@
 //   gefscat     ensemble CAT probability from GEFS, days 3–7 ahead
 //   dust        GEFS-Aerosols dust optical depth classes, 5 days (no airport values)
 //   nat         today's North Atlantic track message (FAA NOTAM system, scripts/nat-message.js)
-//   since       the observed weather of the current ISO week so far, Monday 00Z … now, in three sub-parts:
+//   since       the observed weather of the current ISO week so far, Monday 00Z … now, in six sub-parts:
 //               wxreview  US convective SIGMETs (IEM archive) and SPC storm reports — nothing international,
 //                         no pilot reports, no airport observations (scripts/fetch-wxreview.js fetchUsObserved)
 //               lightning EUMETSAT MTG Lightning Imager, hours with lightning per 0.5° cell (Europe/NAT, Middle East)
 //               mrms      NOAA MRMS radar storm hours (≥ 40 dBZ) and radar hail per 0.5° cell (US)
-// window = today (UTC) … today + 6: the forecast days start on the day of the run; since.window = Monday … today.
+//               and, from 2026-10-12, over at least the last 3 days (on Monday from Saturday, on Tuesday from Sunday):
+//               nat       the North Atlantic tracks of every day, both directions (public NAT archive LSY_NAT_Track,
+//                         scripts/fetch-natarchive.js)
+//               gfs       GFS 00Z analyses: jet at 250 hPa (FL340) and the flight-level grids (tropopause, max-wind
+//                         level, freezing level), three map frames (scripts/fetch-wxreview.js fetchGfsObserved)
+//               faa       FAA Command Center weather restrictions per day and ARTCC, airports as positions only
+//                         (scripts/fetch-faa.js fetchFaaObserved; positions from OurAirports)
+// window = today (UTC) … today + 6: the forecast days start on the day of the run; since.window = Monday … today;
+// the window of nat, gfs and faa (extWindowOf) = Monday … today, or today − 2 … today when that starts earlier, with
+// weekFrom (the Monday) and beforeWeek (the days before it).
 //
 // Incremental: lightning (one frame per hour) and MRMS (one file per hour) are not downloaded again for hours an
-// earlier run of the same week already read. --cache DIR holds lightning-<week>.json and mrms-<week>.json from the
-// previous run (the workflow restores them from the data branch); a missing, corrupt or other-week cache means
-// starting fresh. The updated caches are written to <out>/cache/ next to latest.json and published with it.
+// earlier run of the same week already read; the GFS analyses and the FAA advisory pages of the window are not read
+// again either. --cache DIR holds lightning-<week>.json, mrms-<week>.json, gfs.json and faa.json from the previous run
+// (the workflow restores them from the data branch); a missing, corrupt or other-week cache means starting fresh. The
+// updated caches are written to <out>/cache/ next to latest.json and published with it.
 //
 // Requests: every request goes through one wrapper that counts requests and bytes per part and host,
 // and stops a host for the rest of the run after HTTP 403 or 429 (no retry, no other path). --deny-file
@@ -39,7 +49,8 @@
 // latest.json (schema "lsy-wx-relay/1"): { schema, generatedAt, relayRun {id, url}, window {from, to},
 // parts {wxoutlook, sigwx, sigwxModel, gefscat, dust, nat, since} (each the same structure as the fetcher's
 // weekly snapshot, or null; since = {window, wxreview, lightning, mrms}), status {<part>: {ok, error?, seconds,
-// requests, megabytes, hosts}, 'since.wxreview' …}, attribution [], disclaimer }. See README.md.
+// requests, megabytes, hosts}, 'since.wxreview' …}, attribution [], disclaimer }. See README.md. The 2026-10-12 sub-parts
+// keep the schema name: a reader of lsy-wx-relay/1 that does not know them ignores them.
 // ---------------------------------------------------------------------------
 'use strict';
 
@@ -50,7 +61,11 @@ const { AsyncLocalStorage } = require('async_hooks');
 const SCHEMA = 'lsy-wx-relay/1';
 const SCRIPTS = path.join(__dirname, 'scripts');
 const PART_KEYS = ['wxoutlook', 'sigwx', 'sigwxModel', 'gefscat', 'dust', 'nat', 'since'];
-const SINCE_KEYS = ['wxreview', 'lightning', 'mrms'];
+const SINCE_KEYS = ['wxreview', 'lightning', 'mrms', 'nat', 'gfs', 'faa'];
+// The sub-parts on the window of at least MIN_DAYS days (extWindowOf), and what the faa part must never carry.
+const SINCE_EXT = ['nat', 'gfs', 'faa'];
+const MIN_DAYS = 3;
+const FAA_PRIVATE = ['faa', 'icao', 'code', 'name', 'iata'];
 const DISCLAIMER = 'MODEL AND FORECAST DATA, NOT FOR OPERATIONAL USE. Not a flight-planning, dispatch or pilot-briefing product and not an ' +
   'official meteorological service: for operations use the approved sources (WAFC charts via SADIS/WIFS, SIGMETs, national meteorological ' +
   'services). Model-derived layers are computed by this relay and are not official products; days 4–7 are low confidence. Every part carries ' +
@@ -74,10 +89,13 @@ const ATTRIBUTION_SINCE = {
   wxreview: () => 'US convective SIGMETs: NOAA/NWS Aviation Weather Center, via the Iowa Environmental Mesonet SIGMET archive (Iowa State University, ' +
     'public domain). SPC storm reports: NOAA/NWS Storm Prediction Center, preliminary (public domain).',
   nat: () => 'North Atlantic track message: FAA NOTAM System (nms.aim.faa.gov, US Government work); the tracks are issued by Shanwick (EGGX) and Gander (CZQX).',
+  natDays: page => 'North Atlantic tracks of the days so far: the FAA NOTAM System track messages (US Government work) as captured twice a day in ' + page + '.',
+  faa: () => 'US weather restrictions: FAA Air Traffic Control System Command Center advisories (fly.faa.gov, US Government work, public domain); reduced ' +
+    'by this relay to counts per day and ARTCC. Airport positions: OurAirports (public domain).',
 };
 
-// Part limits (s). The fetchers stop starting requests well before (soft deadlines 100–210 s); the sum
-// stays under the workflow's job timeout.
+// Part limits (s). The fetchers stop starting requests well before (soft deadlines 90–240 s); the sum plus 60 s is
+// the whole run's limit (2265 s with the 2026-10-12 sub-parts), under the workflow's job timeout of 40 min.
 const PARTS = {
   wxoutlook: { limit: 240, run: () => req('fetch-wxoutlook.js').fetchWxOutlook({ hubs: [] }) },
   sigwx: { limit: 240, run: w => req('fetch-sigwx.js').fetchSigwx({ from: w.from, to: w.to, aheadOnly: true }) },
@@ -91,6 +109,15 @@ const SINCE = {
   wxreview: { limit: 120, run: sw => req('fetch-wxreview.js').fetchUsObserved({ from: sw.from, to: sw.to }) },
   lightning: { limit: 270, cache: true, run: (sw, cache) => req('fetch-lightning.js').fetchLightning({ from: sw.from, to: sw.to, cache, maxFrames: 170, softDeadlineS: 220 }) },
   mrms: { limit: 300, cache: true, run: (sw, cache) => req('fetch-mrms.js').fetchMrms({ from: sw.from, to: sw.to, cache, maxFiles: 110, softDeadlineS: 240 }) },
+  // 2026-10-12, on extWindowOf(): a few small files; one analysis a day (cache: only new days); the FAA list of each day
+  // plus the advisory pages not read before (cache, a soft deadline; one OurAirports download when an airport is new).
+  // The caches of gfs and faa are not per week (cache/gfs.json, cache/faa.json): the window reaches into the last week.
+  nat: { limit: 45, run: xw => req('fetch-natarchive.js').fetchNatArchive({ from: xw.from, to: xw.to }) },
+  gfs: { limit: 120, cache: true, weekly: false, run: (xw, cache) => req('fetch-wxreview.js').fetchGfsObserved({ from: xw.from, to: xw.to, cache, softDeadlineS: 90 }) },
+  faa: { limit: 150, cache: true, weekly: false, run: (xw, cache) => {
+    const F = req('fetch-faa.js');
+    return F.fetchFaaObserved({ from: xw.from, to: xw.to, cache, softDeadlineS: 110, positionsUrl: F.OURAIRPORTS_CSV });
+  } },
 };
 PARTS.nat = { limit: 60, run: async () => {
   const notes = [], live = await req('nat-message.js').fetchNatLive(notes);
@@ -117,6 +144,13 @@ function sinceWindowOf(nowMs) {
   const to = new Date(nowMs).toISOString().slice(0, 10), dow = new Date(to + 'T00:00:00Z').getUTCDay() || 7;
   return { from: addDays(to, 1 - dow), to, asOf: new Date(nowMs).toISOString(), week: isoWeekOf(to) };
 }
+// The window of the nat, gfs and faa sub-parts: the same week, but never fewer than the last MIN_DAYS days, so a file
+// read on Monday or Tuesday is not almost empty. weekFrom = the Monday; beforeWeek = the days before it (or []).
+function extWindowOf(sw) {
+  const from = addDays(sw.to, 1 - MIN_DAYS) < sw.from ? addDays(sw.to, 1 - MIN_DAYS) : sw.from, beforeWeek = [];
+  for (let d = from; d < sw.from; d = addDays(d, 1)) beforeWeek.push(d);
+  return { from, to: sw.to, asOf: sw.asOf, week: sw.week, weekFrom: sw.from, beforeWeek };
+}
 
 // ---- request wrapper -----------------------------------------------------------------------------
 const als = new AsyncLocalStorage();
@@ -141,6 +175,9 @@ function installFetch(opts) {
       H(cx.part, host).refused++;
       throw new Error('relay: ' + host + ' is on the deny list (HTTP 403 rule); not contacted');
     }
+    // The relay's own identity only: a request whose User-Agent carries an e-mail address (the project's private one) is not sent.
+    const hd = init && init.headers, ua = hd ? (typeof hd.get === 'function' ? hd.get('user-agent') : (hd['User-Agent'] || hd['user-agent'])) : null;
+    if (ua && /[^\s@()]+@[^\s@()]+\.[a-z]{2,}/i.test(String(ua))) { H(cx.part, host).refused++; throw new Error('relay: request to ' + host + ' not sent — its User-Agent carries an e-mail address'); }
     const h = H(cx.part, host);
     h.requests++; S(cx.part).requests++;
     const res = await orig(input, init);
@@ -185,7 +222,8 @@ function finishPart(key, s, win, generatedAt) {
   delete s.summary;
   s.generatedAt = generatedAt;
   s.mode = 'relay';
-  s.window = key.startsWith('since.') ? { from: win.from, to: win.to, week: win.week, asOf: win.asOf }
+  s.window = key.startsWith('since.') ? Object.assign({ from: win.from, to: win.to, week: win.week, asOf: win.asOf },
+      win.weekFrom ? { weekFrom: win.weekFrom, beforeWeek: (win.beforeWeek || []).slice() } : {})
     : key === 'nat' ? { from: win.from, to: win.from, week: null } : { from: win.from, to: win.to, week: null };
   if (key === 'since.wxreview') {
     // Only the US convective SIGMETs and the SPC reports may be in it: everything international or airport-specific goes.
@@ -198,6 +236,17 @@ function finishPart(key, s, win, generatedAt) {
         Object.keys(d.counts || {}).forEach(r => { if (r !== 'na') { emptied.push('wxreview.sigmetGrid.days counts.' + r); delete d.counts[r]; } }); });
       Object.keys(g.areas || {}).forEach(a => { if (a !== 'na') { emptied.push('wxreview.sigmetGrid.areas.' + a); delete g.areas[a]; } });
     }
+  }
+  if (key === 'since.nat') {
+    // The 50W check of the project's fix table is not a map layer; without that table its note would only confuse.
+    if (s.lat50wSeen !== undefined) delete s.lat50wSeen;
+    s.notes = (s.notes || []).filter(n => !/nat-fixes\.json/.test(n));
+  }
+  if (key === 'since.faa') {
+    // Belt and braces: no airport code or name, no list of airports under a centre, no centre names.
+    (s.airports || []).forEach((a, i) => FAA_PRIVATE.forEach(k => { if (a && k in a) { emptied.push('faa.airports[' + i + '].' + k); delete a[k]; } }));
+    (s.days || []).forEach(d => Object.keys(d.centers || {}).forEach(c => { if (d.centers[c] && d.centers[c].airports) { emptied.push('faa.days ' + d.date + ' ' + c + '.airports'); delete d.centers[c].airports; } }));
+    if (s.names) { emptied.push('faa.names'); delete s.names; }
   }
   const empty = (obj, k, label) => { if (obj && Array.isArray(obj[k])) { if (obj[k].length) emptied.push(label + ' (' + obj[k].length + ')'); obj[k] = []; } };
   if (key === 'wxoutlook') {
@@ -281,13 +330,32 @@ function validate(L) {
     if (!ymd(sw.from) || !ymd(sw.to) || sw.from > sw.to || new Date(sw.from + 'T00:00:00Z').getUTCDay() !== 1 || addDays(sw.from, 6) < sw.to || isNaN(Date.parse(sw.asOf)))
       P.push('since.window must run from a Monday to at most the Sunday after, with asOf');
     Object.keys(si).forEach(k => { if (k !== 'window' && !SINCE_KEYS.includes(k)) P.push('unknown since part ' + k); });
+    const xw = ymd(sw.from) && ymd(sw.to) ? extWindowOf(sw) : { from: null, to: null, beforeWeek: [] };
     SINCE_KEYS.forEach(k => {
       if (!(k in si)) P.push('since.' + k + ' missing (null when it failed)');
       const s = st['since.' + k];
       if (!s || typeof s.ok !== 'boolean' || s.ok !== (si[k] != null)) P.push('status.since.' + k + ' missing or not matching');
-      const x = si[k];
-      if (x && (!x.window || x.window.from !== sw.from || x.window.to !== sw.to)) P.push('since.' + k + '.window ≠ since.window');
+      const x = si[k], ext = SINCE_EXT.includes(k), w0 = ext ? xw : sw;
+      if (x && (!x.window || x.window.from !== w0.from || x.window.to !== w0.to)) P.push('since.' + k + '.window ≠ ' + (ext ? 'the window of at least ' + MIN_DAYS + ' days' : 'since.window'));
+      else if (x && ext && (x.window.weekFrom !== sw.from || JSON.stringify(x.window.beforeWeek) !== JSON.stringify(xw.beforeWeek))) P.push('since.' + k + '.window weekFrom / beforeWeek wrong');
     });
+    const inX = d => typeof d === 'string' && d >= xw.from && d <= xw.to;
+    const nd = si.nat;
+    if (nd && (!Array.isArray(nd.days) || nd.days.some(d => !inX(d.date) || ['eastbound', 'westbound'].some(k => d[k] && !Array.isArray(d[k].tracks)))))
+      P.push('since.nat.days must be days of its window with tracks per direction');
+    const gf = si.gfs;
+    if (gf) {
+      if (!gf.jet || !Array.isArray(gf.jet.days) || JSON.stringify(gf.jet.levels) !== '["250"]') P.push('since.gfs.jet must hold the 250 hPa (FL340) days only');
+      [gf.jet, gf.levels].forEach(o => ((o && o.days) || []).forEach(d => { if (!inX(d.date)) P.push('since.gfs ' + d.date + ' outside its window'); }));
+    }
+    const fa = si.faa;
+    if (fa) {
+      if (!Array.isArray(fa.days) || !Array.isArray(fa.airports)) P.push('since.faa days / airports missing');
+      (fa.airports || []).forEach((a, i) => { if (!a || FAA_PRIVATE.some(k => k in a)) P.push('since.faa.airports[' + i + '] carries an airport code or name'); });
+      (fa.days || []).forEach(d => { if (!inX(d.date)) P.push('since.faa ' + d.date + ' outside its window');
+        if (Object.values(d.centers || {}).some(c => c && c.airports)) P.push('since.faa ' + d.date + ': a centre lists its airports'); });
+      if (fa.names) P.push('since.faa.names must not be published');
+    }
     if (!SINCE_KEYS.some(k => si[k])) P.push('since has no sub-part (null when all failed)');
     const r = si.wxreview;
     if (r) {
@@ -335,16 +403,19 @@ function assemble(win, generatedAt, results, env, sinceWin) {
   if (si && si.wxreview) L.attribution.push(ATTRIBUTION_SINCE.wxreview());
   if (si && si.lightning) L.attribution.push(ATTRIBUTION_SINCE.lightning((/product (\d{4})/.exec(si.lightning.attribution || '') || [])[1] || generatedAt.slice(0, 4)));
   if (si && si.mrms) L.attribution.push(ATTRIBUTION_SINCE.mrms());
+  if (si && si.nat) L.attribution.push(ATTRIBUTION_SINCE.natDays((si.nat.source && si.nat.source.page) || 'a public archive'));
+  if (si && si.faa) L.attribution.push(ATTRIBUTION_SINCE.faa());
   return L;
 }
 
 // ---- the incremental caches (lightning, mrms) ----------------------------------------------------
-const cacheName = (kind, week) => kind + '-' + week + '.json';
+// Per week (lightning-<week>.json) or, for the parts whose window reaches into the last week, one file (gfs.json).
+const cacheName = (kind, week) => kind + (week ? '-' + week : '') + '.json';
 // { prev: object | null, note: string | null } — a missing file is a plain fresh start, an unreadable one says so.
 function loadCache(dir, kind, week) {
   if (!dir) return { prev: null, note: null };
   const p = path.join(dir, cacheName(kind, week));
-  if (!fs.existsSync(p)) return { prev: null, note: 'no cache for ' + week + ' (fresh start)' };
+  if (!fs.existsSync(p)) return { prev: null, note: 'no cache for ' + (week || kind) + ' (fresh start)' };
   try { return { prev: JSON.parse(fs.readFileSync(p, 'utf8')), note: null }; } catch (e) { return { prev: null, note: 'cache unreadable (' + String(e.message).slice(0, 60) + '), fresh start' }; }
 }
 
@@ -358,8 +429,9 @@ async function main(argv) {
   const t0 = Date.now(), win = windowOf(t0), generatedAt = new Date(t0).toISOString();
   const budget = ORDER.filter(k => k !== 'since').reduce((s, k) => s + PARTS[k].limit, 0) + SINCE_KEYS.reduce((s, k) => s + SINCE[k].limit, 0) + 60;
   setTimeout(() => { log('relay: FAILED — whole run over ' + budget + ' s; nothing written'); process.exit(1); }, budget * 1000).unref();
-  const sw = sinceWindowOf(t0), cacheDir = arg('--cache') ? path.resolve(arg('--cache')) : null;
-  log('relay: window ' + win.from + ' .. ' + win.to + ' · since ' + sw.from + ' .. ' + sw.asOf.slice(0, 16) + 'Z (' + sw.week + ')' + (only ? ' · parts ' + only.join(',') : ''));
+  const sw = sinceWindowOf(t0), xw = extWindowOf(sw), cacheDir = arg('--cache') ? path.resolve(arg('--cache')) : null;
+  log('relay: window ' + win.from + ' .. ' + win.to + ' · since ' + sw.from + ' .. ' + sw.asOf.slice(0, 16) + 'Z (' + sw.week + ')' +
+      (xw.from !== sw.from ? ', ' + SINCE_EXT.join('/') + ' from ' + xw.from : '') + (only ? ' · parts ' + only.join(',') : ''));
   const net = installFetch({ denyFile: arg('--deny-file'), allow, log });
   const results = {}, caches = {};
   const one = async (k, w, limit, fn, fin) => {
@@ -376,18 +448,21 @@ async function main(argv) {
         (r.emptied && r.emptied.length ? ' · emptied ' + r.emptied.join(', ') : ''));
     return r;
   };
+  // --parts: a part name, "since" for all its sub-parts, or "since.<sub>" for single ones.
   for (const k of ORDER) {
-    if (only && !only.includes(k)) continue;
-    if (k !== 'since') { await one(k, win, PARTS[k].limit, null, win); continue; }
+    if (k !== 'since') { if (!only || only.includes(k)) await one(k, win, PARTS[k].limit, null, win); continue; }
     for (const sk of SINCE_KEYS) {
-      const def = SINCE[sk];
-      if (!def.cache) { await one('since.' + sk, sw, def.limit, w => def.run(w), sw); continue; }
-      const lc = loadCache(cacheDir, sk, sw.week), holder = { prev: lc.prev };
-      const r = await one('since.' + sk, sw, def.limit, w => def.run(w, holder), sw);
+      if (only && !only.includes('since') && !only.includes('since.' + sk)) continue;
+      const def = SINCE[sk], w = SINCE_EXT.includes(sk) ? xw : sw;
+      if (!def.cache) { await one('since.' + sk, w, def.limit, x => def.run(x), w); continue; }
+      const ck = def.weekly === false ? null : sw.week;
+      const lc = loadCache(cacheDir, sk, ck), holder = { prev: lc.prev };
+      const r = await one('since.' + sk, w, def.limit, x => def.run(x, holder), w);
       const info = holder.info || { reused: 0, fetched: r.requests, dropped: null };
-      r.cache = { file: 'cache/' + cacheName(sk, sw.week), reused: info.reused, fetched: info.fetched, dropped: info.dropped || lc.note || null };
-      // A failed run keeps the previous cache of the week (when it was one), so nothing already read is lost.
-      caches[sk] = holder.next || (lc.prev && lc.prev.from === sw.from ? lc.prev : null);
+      r.cache = { file: 'cache/' + cacheName(sk, ck), reused: info.reused, fetched: info.fetched, dropped: info.dropped || lc.note || null };
+      // A failed run keeps the previous cache of the week (when it was one; gfs/faa: the previous file, pruned by the next
+      // run that succeeds), so nothing already read is lost.
+      caches[sk] = holder.next || (def.weekly === false ? lc.prev : (lc.prev && lc.prev.from === sw.from ? lc.prev : null));
     }
   }
   net.restore();
@@ -403,7 +478,7 @@ async function main(argv) {
       Math.round(Object.values(results).reduce((s, r) => s + (r.megabytes || 0), 0) * 10) / 10 + ' MB');
   if (bad || errors.length) { log('relay: FAILED — ' + (bad ? 'privacy check' : 'contract') + '; nothing written, the published file stays as it was'); return 1; }
   // The caches are published too (data branch): the same privacy check, built-in rules (they hold grids only).
-  const cacheTexts = Object.entries(caches).filter(([, c]) => c).map(([k, c]) => [cacheName(k, sw.week), JSON.stringify(c)]);
+  const cacheTexts = Object.entries(caches).filter(([, c]) => c).map(([k, c]) => [cacheName(k, SINCE[k].weekly === false ? null : sw.week), JSON.stringify(c)]);
   const cbad = PC.report([].concat(...cacheTexts.map(([n, t]) => PC.checkText('cache/' + n, t, terms))), cacheTexts.length, !!terms);
   if (cbad) { log('relay: FAILED — privacy check of the caches; nothing written'); return 1; }
   fs.mkdirSync(outDir, { recursive: true });
@@ -419,8 +494,8 @@ async function main(argv) {
   return 0;
 }
 
-module.exports = { SCHEMA, PART_KEYS, SINCE_KEYS, ATTRIBUTION, ATTRIBUTION_SINCE, DISCLAIMER, windowOf, sinceWindowOf, isoWeekOf, finishPart, validate, assemble,
-                   loadCache, cacheName, installFetch, denyList, main };
+module.exports = { SCHEMA, PART_KEYS, SINCE_KEYS, SINCE_EXT, MIN_DAYS, ATTRIBUTION, ATTRIBUTION_SINCE, DISCLAIMER, windowOf, sinceWindowOf, extWindowOf, isoWeekOf,
+                   finishPart, validate, assemble, loadCache, cacheName, installFetch, denyList, main };
 if (require.main === module) {
   if (!fs.existsSync(path.join(SCRIPTS, 'fetch-util.js'))) {
     console.log('relay: scripts/ not found next to relay.js — run the packaged copy (node tools/wx-relay/package.js, then dist/relay.js).');
