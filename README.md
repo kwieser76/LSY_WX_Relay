@@ -29,12 +29,13 @@ GitHub Actions, 04:30, 10:30, 16:30 and 22:30 UTC, a backup slot 71 min after ea
 - `main` holds the code: `relay.js`, the fetchers and decoders in `scripts/` (Node 20, no
   dependencies), `config.json`, `privacy-check.js` and the workflow `.github/workflows/wx-relay.yml`.
 - `data` holds `latest.json` and `cache/lightning-<week>.json`, `cache/mrms-<week>.json`, `cache/gfs.json`,
-  `cache/faa.json`. Every run replaces the branch with a single new commit, so the repository does not grow
+  `cache/faa.json`, `cache/sigwx.json`. Every run replaces the branch with a single new commit, so the repository does not grow
   and the URL always points at the newest file. The caches hold what earlier runs already read: the
   lightning frames and radar hours of the current ISO week (reduced to 0.5° cells), the reduced GFS analyses
   of the last days, and per FAA advisory (keyed by day and advisory number) the cause, period and airport
-  position it gave. A run downloads only what is new; the week caches are dropped when the week changes,
-  `gfs.json` and `faa.json` keep the days of the current window only, and a missing or broken cache only
+  position it gave, and the SIGWX charts of the last days (official and model-derived). A run downloads only
+  what is new; the week caches are dropped when the week changes, `gfs.json`, `faa.json` and `sigwx.json` keep
+  the days of the current window only, and a missing or broken cache only
   means that run starts fresh.
 - A run that fails completely (every source failed, or the privacy check found something) publishes
   nothing; the previous `latest.json` stays. A single source that fails becomes `null` in the file, with
@@ -61,13 +62,14 @@ GitHub Actions, 04:30, 10:30, 16:30 and 22:30 UTC, a backup slot 71 min after ea
 | `parts.gefscat` | ensemble CAT probability, days 3–7: the share of the 31 GEFS members whose Ellrod index shows CAT potential |
 | `parts.dust` | dust optical depth classes from GEFS-Aerosols, 5 days |
 | `parts.nat` | today's North Atlantic track message: `{ fetchedAt, page, sets }`, one set per direction with its tracks (route, entry, latitude at 30/40/50W), TMI, split and remarks |
-| `parts.since` | the observed weather of the current ISO week, Monday 00Z to the run: `{ window {from, to, asOf, week}, wxreview, lightning, mrms, nat, gfs, faa }` (each null when it failed; `nat`, `gfs` and `faa` have a window of their own, see below) |
+| `parts.since` | the observed weather of the current ISO week, Monday 00Z to the run: `{ window {from, to, asOf, week}, wxreview, lightning, mrms, nat, gfs, faa, sigwx }` (each null when it failed; `nat`, `gfs`, `faa` and `sigwx` have a window of their own, see below) |
 | `parts.since.wxreview` | US convective SIGMETs (counts, and a 1° grid over North America of how often a cell lay inside one at the 3-hourly sample moments) and SPC storm reports (per day and as points). Nothing else: no international SIGMETs, no pilot reports, no airport observations |
 | `parts.since.lightning` | EUMETSAT MTG Lightning Imager: per day and 0.5° cell the hours whose sampled frame (one 5-minute frame per hour) showed lightning, Europe/North Atlantic and the Middle East |
 | `parts.since.mrms` | NOAA MRMS: per day and 0.5° cell the hours with radar reflectivity ≥ 40 dBZ, and the day's radar-estimated hail, US |
 | `parts.since.nat` | the North Atlantic tracks of every day of its window, both directions, with entry and exit points |
 | `parts.since.gfs` | GFS 00Z analyses of every day of its window: jet at 250 hPa (FL340), tropopause, max-wind and freezing level, three map frames |
 | `parts.since.faa` | FAA Command Center weather restrictions per day and ARTCC; airports with weather programs as positions (no codes, no names) |
+| `parts.since.sigwx` | SIGWX of every day of its window at 12Z: the official WAFS chart and the model-derived picture from the GFS 12Z analysis |
 | `status.<part>` | `{ ok, error?, seconds, requests, megabytes, hosts }`; the since sub-parts as `status["since.lightning"]` etc., with `cache { reused, fetched }` |
 | `attribution` | the credit lines below; show them with the data |
 | `disclaimer` | the "not for operational use" text |
@@ -76,11 +78,11 @@ Each part keeps its own model run, issue and valid times, label, attribution and
 base64 or run-length encoded as described inside each part. There are no airport-specific values in this
 file.
 
-### The last days: `since.nat`, `since.gfs`, `since.faa` (added 2026-10-12, schema unchanged)
+### The last days: `since.nat`, `since.gfs`, `since.faa`, `since.sigwx` (added 2026-10-12 and 2026-10-13, schema unchanged)
 
-A reader that knows only the parts above ignores these three; the schema name stays `lsy-wx-relay/1`.
+A reader that knows only the parts above ignores these four; the schema name stays `lsy-wx-relay/1`.
 
-- **Window.** Each of the three has `window { from, to, week, asOf, weekFrom, beforeWeek }`: `to` is the
+- **Window.** Each of the four has `window { from, to, week, asOf, weekFrom, beforeWeek }`: `to` is the
   run's day, `weekFrom` the Monday of the ISO week (= `since.window.from`), `from` the Monday or `to − 2`,
   whichever is earlier, so the window never holds fewer than three days. `beforeWeek` lists the dates before
   the Monday (Monday: Saturday and Sunday; Tuesday: Sunday; otherwise `[]`). Dates are UTC.
@@ -107,6 +109,16 @@ A reader that knows only the parts above ignores these three; the schema name st
   `airports[]`: `{ lat, lon, artcc, wxDays, hours, days { date: { gs, gdp, afp, wx: true, hours } } }`, the
   airports with a weather program, by position only. `weather.days[]`: `{ date, programs }`. Canada: no
   public data (not the same as no restrictions).
+- **`since.sigwx`** (added 2026-10-13, same window) `{ official, model, notes }`, each half null when it
+  failed. `official` = `{ label, attribution, disclaimer, issuer, issuerNote, pages, choice, areas, boxes, days,
+  missing, notes }`, `days[]` one chart per day valid 12Z in the shape of `parts.sigwx.ahead[]` (`{ date, run,
+  valid, lead, features, counts, score }`): the 06Z run +6 h where it is out, else 00Z +12 h, the previous day's
+  18Z +18 h or 12Z +24 h. A stand-in for today or yesterday is asked for again on the next run. `model` = `{ label,
+  disclaimer, attribution, model, res, encoding, cat, past, areas { na, atl, me }, missing, notes }`, the frames
+  in the shape of `parts.sigwxModel.areas` with `kind: 'analysis'` days only (GFS 12Z analysis; CB from the 06Z
+  cycle +6 h; CAT with the fixed thresholds). The 12Z analysis is out at about 17Z, so today joins on a late
+  run; until then it is in `missing` and `notes` ("not yet published"). For today a reader can use the 12Z chart
+  of `parts.sigwx.ahead` and the forecast day of `parts.sigwxModel`.
 
 ## Sources and licences
 
@@ -118,7 +130,7 @@ A reader that knows only the parts above ignores these three; the schema name st
 | ECMWF IFS HRES open data ([data.ecmwf.int](https://data.ecmwf.int/forecasts)) | 250 hPa wind for the model comparison, convective potential | CC BY 4.0 — "Contains ECMWF Open Data"; values derived (modified) by this relay |
 | NOAA SPC, NHC/CPHC, WPC, CPC (api.weather.gov), SWPC | outlooks, tropical cyclones, space weather | public domain |
 | US Navy JTWC (RSS and warning texts) | tropical cyclones, West Pacific / Indian Ocean / Southern Hemisphere | US Government work |
-| NOAA/NWS Aviation Weather Center, WAFS SIGWX GeoJSON | official SIGWX, up to T+48 | the files name no issuing centre; clipped and simplified here, not an official chart |
+| NOAA/NWS Aviation Weather Center, WAFS SIGWX GeoJSON | official SIGWX, up to T+48, and the 12Z chart of each day of the current week (the files are kept about 30 days) | the files name no issuing centre; clipped and simplified here, not an official chart |
 | FAA NOTAM System, North Atlantic track message ([nms.aim.faa.gov/nat](https://nms.aim.faa.gov/nat)) | today's NAT tracks | US Government work (public domain); tracks issued by Shanwick and Gander |
 | Iowa Environmental Mesonet (Iowa State University), SIGMET archive | US convective SIGMETs of the week | public domain ([disclaimer](https://mesonet.agron.iastate.edu/disclaimer.php)); the SIGMETs are NOAA/NWS products |
 | NOAA SPC storm reports ([spc.noaa.gov/climo](https://www.spc.noaa.gov/climo/online/)) | tornado, wind and hail reports of the week (preliminary) | public domain |

@@ -517,7 +517,9 @@ async function getLayer(url, timeoutMs) {
 
 // aheadOnly (the public week-ahead relay, tools/wx-relay): skip the past week entirely, so only the
 // newest run's ahead charts are requested (about 16 instead of about 73 requests). Absent = unchanged.
-async function fetchSigwx({ from, to, nowMs, gapMs, asOf, aheadOnly }) {   // nowMs, gapMs: tests only
+// pastOnly (the relay's This-week part, fetchSigwxObserved): the past days only, no week ahead; dates = the
+// past days to read instead of from..to (the days not in the relay's cache). Absent = unchanged.
+async function fetchSigwx({ from, to, nowMs, gapMs, asOf, aheadOnly, pastOnly, dates }) {   // nowMs, gapMs: tests only
   const t0 = Date.now(), now = nowMs != null ? nowMs : (asOf ? Date.parse(asOf) : Date.now());
   const gap = gapMs != null ? gapMs : GAP_MS;
   const notes = [], requests = {}, status = {};
@@ -554,7 +556,7 @@ async function fetchSigwx({ from, to, nowMs, gapMs, asOf, aheadOnly }) {   // no
 
   // Past week: one chart per day, valid 12Z.
   const days = [], gaps = [];
-  for (const date of (aheadOnly ? [] : daysOf(from, to))) {
+  for (const date of (aheadOnly ? [] : (dates || daysOf(from, to)))) {
     if (date < archiveFrom) { gaps.push(date + ' (older than the 30-day archive)'); continue; }
     let got = null;
     for (const c of pastCandidates(date)) {
@@ -572,7 +574,7 @@ async function fetchSigwx({ from, to, nowMs, gapMs, asOf, aheadOnly }) {   // no
   const aheadFrom = new Date(now).toISOString().slice(0, 10);
   const ahead = [];
   let aheadRun = null;
-  for (const run of aheadRuns(now, 3)) {
+  for (const run of (pastOnly ? [] : aheadRuns(now, 3))) {
     if (stopped) break;
     const slices = aheadSlices(run, aheadFrom);
     if (!slices.length) continue;
@@ -601,6 +603,8 @@ async function fetchSigwx({ from, to, nowMs, gapMs, asOf, aheadOnly }) {   // no
     aheadCover = { run: stamp(r0), until, days: covered, notCovered,
       note: 'Week ahead: official SIGWX from the ' + stamp(r0).slice(11) + ' run of ' + fmtDay(aheadRun.runDate) + ' reaches T+48 (' + fmtDay(until.slice(0, 10)) + ' ' + until.slice(11) + '); ' +
             'charts for ' + covered.map(fmtDay).join(' and ') + ' 12Z. ' + (notCovered.length ? fmtDay(notCovered[0]) + '–' + fmtDay(notCovered[notCovered.length - 1]) + ' (days ' + (weekAhead.indexOf(notCovered[0]) + 1) + '–7) are NOT covered: no official SIGWX beyond 48 h (use the model-derived layer, labelled as such).' : '') };
+  } else if (pastOnly) {
+    aheadCover = { run: null, until: null, days: [], notCovered: [], note: 'Week ahead: not fetched (past days only).' };
   } else {
     aheadCover = { run: null, until: null, days: [], notCovered: weekAhead, note: 'Week ahead: no official SIGWX chart could be read; days 1–7 are not covered.' };
     notes.push('week ahead: no run found');
@@ -627,6 +631,7 @@ async function fetchSigwx({ from, to, nowMs, gapMs, asOf, aheadOnly }) {   // no
   };
   if (dupes) out.duplicatesDropped = dupes;
   if (aheadOnly) out.aheadOnly = true;
+  if (pastOnly) out.pastOnly = true;
   out.seconds = Math.round((Date.now() - t0) / 1000);
   out.snapshotBytes = Buffer.byteLength(JSON.stringify(out));
   const nf = d => d.features.length;
@@ -634,6 +639,49 @@ async function fetchSigwx({ from, to, nowMs, gapMs, asOf, aheadOnly }) {   // no
                  ahead.length + ' ahead (' + (aheadCover.run || 'none') + ') · ' + days.concat(ahead).reduce((a, d) => a + nf(d), 0) + ' features · ' +
                  (requests[HOST] || 0) + ' requests, ' + out.megabytes + ' MB, ' + out.seconds + ' s · snapshot ' + Math.round(out.snapshotBytes / 1024) + ' KB'];
   return out;
+}
+
+// ---- This week (the public relay's since.sigwx, 2026-10-13) --------------------------------------
+// The official chart of each day of This week (Monday to today, at least the last 3 days), one per day valid 12Z,
+// chosen as for the briefing week (06Z +6 h first). cache = { prev, next, info } as the relay's other incremental
+// parts: a day is read once and kept while it lies in the window. A chart is final when it is the first choice
+// (06Z run +6 h) or its day is two or more days old (every stand-in run is long published by then); a stand-in for
+// today or yesterday is kept but asked for again on the next run. A day not read keeps the chart of the cache.
+const OBS_CACHE_VERSION = 1;
+function readObsCache(prev, from, to) {
+  if (!prev || prev.kind !== 'sigwx' || prev.version !== OBS_CACHE_VERSION || !prev.days || typeof prev.days !== 'object') return { days: {}, dropped: prev ? 'cache of another kind or version, fresh start' : null };
+  const days = {}; let dropped = 0;
+  Object.keys(prev.days).forEach(d => { const x = prev.days[d]; if (d >= from && d <= to && x && x.chart && Array.isArray(x.chart.features)) days[d] = x; else dropped++; });
+  return { days, dropped: dropped ? dropped + ' day(s) outside the window dropped' : null };
+}
+async function fetchSigwxObserved({ from, to, cache, nowMs, gapMs }) {   // nowMs, gapMs: tests only
+  const t0 = Date.now(), now = nowMs != null ? nowMs : Date.now(), today = new Date(now).toISOString().slice(0, 10);
+  const prev = cache ? readObsCache(cache.prev, from, to) : { days: {}, dropped: null };
+  const all = daysOf(from, to), need = all.filter(d => !(prev.days[d] && prev.days[d].final));
+  const notes = [], got = Object.assign({}, prev.days);
+  let r = null, fetched = 0;
+  if (need.length) {
+    try { r = await fetchSigwx({ from, to, dates: need, pastOnly: true, nowMs: now, gapMs }); }
+    catch (e) { notes.push('Official SIGWX not read: ' + String(e.message || e).slice(0, 160)); }
+  }
+  if (r) {
+    fetched = r.requests[HOST] || 0;
+    r.days.forEach(d => { got[d.date] = { final: (d.run.slice(11, 13) === '06' && d.lead === 6) || d.date <= U.addDays(today, -2), chart: d }; });
+    r.notes.filter(n => !/^week ahead/.test(n)).forEach(n => notes.push(n));
+  }
+  const days = all.filter(d => got[d]).map(d => got[d].chart), missing = all.filter(d => !got[d]);
+  if (!days.length) throw new Error(notes.join('; ') || 'no official SIGWX chart for ' + from + ' .. ' + to);
+  if (missing.length && !(r && r.notes.some(n => /^no chart for/.test(n)))) notes.push('no chart for ' + missing.join(', ') + ' — no data, not calm');
+  if (cache) {
+    const keep = {}; Object.keys(got).forEach(d => { if (d >= from && d <= to) keep[d] = got[d]; });
+    cache.next = { kind: 'sigwx', version: OBS_CACHE_VERSION, days: keep };
+    cache.info = { reused: all.length - need.length, fetched, dropped: prev.dropped };
+  }
+  const seconds = Math.round((Date.now() - t0) / 1000);
+  return { label: LABEL, attribution: ATTRIBUTION, disclaimer: DISCLAIMER, issuer: ISSUER, issuerNote: ISSUER_NOTE, pages: PAGES,
+           choice: 'one chart per day valid 12Z, from the 06Z run +6 h (the shortest lead); stand-ins 00Z +12 h, previous 18Z +18 h, previous 12Z +24 h',
+           areas: AREA_IDS, boxes: BOXES, days, missing, requests: { [HOST]: fetched }, notes, seconds,
+           summary: [from + ' .. ' + to + ' · ' + days.length + ' chart(s) (' + (all.length - need.length) + ' from the cache) · ' + fetched + ' requests · ' + seconds + ' s'] };
 }
 
 // U.main writes the snapshot pretty-printed; coordinate arrays then take four lines a point. Rewritten
@@ -650,7 +698,8 @@ function rewriteCompact(week) {
 
 module.exports = { BASE, TYPES, BOXES, AREA_IDS, PLACES, PAGES, LABEL, ATTRIBUTION, DISCLAIMER, ISSUER,
                    fileUrl, pastCandidates, aheadRuns, aheadSlices, normalise, clipPolygon, clipLine, simplify, toOut, ringAreaKm2, areaInBox,
-                   parseLayer, touchedAreas, clipFeature, scoreArea, worstOf, buildChart, placeOf, homeArea, chartLine, digest, fetchSigwx };
+                   parseLayer, touchedAreas, clipFeature, scoreArea, worstOf, buildChart, placeOf, homeArea, chartLine, digest, fetchSigwx,
+                   readObsCache, fetchSigwxObserved };
 if (require.main === module) {
   const c = U.cli(process.argv);
   const asOf = c.argOf('--asof');

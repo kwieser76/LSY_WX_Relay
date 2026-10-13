@@ -20,7 +20,7 @@
 //   gefscat     ensemble CAT probability from GEFS, days 3–7 ahead
 //   dust        GEFS-Aerosols dust optical depth classes, 5 days (no airport values)
 //   nat         today's North Atlantic track message (FAA NOTAM system, scripts/nat-message.js)
-//   since       the observed weather of the current ISO week so far, Monday 00Z … now, in six sub-parts:
+//   since       the observed weather of the current ISO week so far, Monday 00Z … now, in seven sub-parts:
 //               wxreview  US convective SIGMETs (IEM archive) and SPC storm reports — nothing international,
 //                         no pilot reports, no airport observations (scripts/fetch-wxreview.js fetchUsObserved)
 //               lightning EUMETSAT MTG Lightning Imager, hours with lightning per 0.5° cell (Europe/NAT, Middle East)
@@ -32,13 +32,18 @@
 //                         level, freezing level), three map frames (scripts/fetch-wxreview.js fetchGfsObserved)
 //               faa       FAA Command Center weather restrictions per day and ARTCC, airports as positions only
 //                         (scripts/fetch-faa.js fetchFaaObserved; positions from OurAirports)
+//               and, from 2026-10-13, on the same window:
+//               sigwx     SIGWX of every day at 12Z: { official, model } — the official WAFS chart (06Z run +6 h first,
+//                         scripts/fetch-sigwx.js fetchSigwxObserved) and the model-derived picture from the GFS 12Z
+//                         analysis (scripts/fetch-sigwx-model.js fetchSigwxModelObserved); each null when it failed
 // window = today (UTC) … today + 6: the forecast days start on the day of the run; since.window = Monday … today;
-// the window of nat, gfs and faa (extWindowOf) = Monday … today, or today − 2 … today when that starts earlier, with
+// the window of nat, gfs, faa and sigwx (extWindowOf) = Monday … today, or today − 2 … today when that starts earlier, with
 // weekFrom (the Monday) and beforeWeek (the days before it).
 //
 // Incremental: lightning (one frame per hour) and MRMS (one file per hour) are not downloaded again for hours an
 // earlier run of the same week already read; the GFS analyses and the FAA advisory pages of the window are not read
-// again either. --cache DIR holds lightning-<week>.json, mrms-<week>.json, gfs.json and faa.json from the previous run
+// again either, nor the SIGWX charts of a day already read. --cache DIR holds lightning-<week>.json, mrms-<week>.json,
+// gfs.json, faa.json and sigwx.json from the previous run
 // (the workflow restores them from the data branch); a missing, corrupt or other-week cache means starting fresh. The
 // updated caches are written to <out>/cache/ next to latest.json and published with it.
 //
@@ -67,9 +72,9 @@ const { AsyncLocalStorage } = require('async_hooks');
 const SCHEMA = 'lsy-wx-relay/1';
 const SCRIPTS = path.join(__dirname, 'scripts');
 const PART_KEYS = ['wxoutlook', 'sigwx', 'sigwxModel', 'gefscat', 'dust', 'nat', 'since'];
-const SINCE_KEYS = ['wxreview', 'lightning', 'mrms', 'nat', 'gfs', 'faa'];
+const SINCE_KEYS = ['wxreview', 'lightning', 'mrms', 'nat', 'gfs', 'faa', 'sigwx'];
 // The sub-parts on the window of at least MIN_DAYS days (extWindowOf), and what the faa part must never carry.
-const SINCE_EXT = ['nat', 'gfs', 'faa'];
+const SINCE_EXT = ['nat', 'gfs', 'faa', 'sigwx'];
 const MIN_DAYS = 3;
 const FAA_PRIVATE = ['faa', 'icao', 'code', 'name', 'iata'];
 const BLOCK_HOURS = 24;
@@ -125,7 +130,25 @@ const SINCE = {
     const F = req('fetch-faa.js');
     return F.fetchFaaObserved({ from: xw.from, to: xw.to, cache, softDeadlineS: 110, positionsUrl: F.OURAIRPORTS_CSV });
   } },
+  // 2026-10-13: SIGWX of each day, official and model side by side (two hosts: AWC, NOMADS/AWS). One cache file holds
+  // both halves (cache/sigwx.json {kind, official, model}); a day read before is not read again (see the two fetchers).
+  sigwx: { limit: 200, cache: true, weekly: false, run: (xw, cache) => fetchSigwxSince(xw, cache) },
 };
+async function fetchSigwxSince(xw, cache) {
+  const prev = cache && cache.prev && cache.prev.kind === 'sigwxSince' ? cache.prev : {};
+  const oc = { prev: prev.official || null }, mc = { prev: prev.model || null }, notes = [];
+  const [o, m] = await Promise.all([
+    req('fetch-sigwx.js').fetchSigwxObserved({ from: xw.from, to: xw.to, cache: oc }).catch(e => { notes.push('Official SIGWX: ' + String(e.message || e).slice(0, 200)); return null; }),
+    req('fetch-sigwx-model.js').fetchSigwxModelObserved({ from: xw.from, to: xw.to, cache: mc }).catch(e => { notes.push('Model SIGWX: ' + String(e.message || e).slice(0, 200)); return null; }),
+  ]);
+  // a half that failed keeps its previous cache, so nothing already read is lost
+  cache.next = { kind: 'sigwxSince', official: oc.next || prev.official || null, model: mc.next || prev.model || null };
+  const ci = [oc.info, mc.info].filter(Boolean);
+  cache.info = { reused: ci.reduce((a, x) => a + x.reused, 0), fetched: ci.reduce((a, x) => a + x.fetched, 0), dropped: ci.map(x => x.dropped).filter(Boolean).join('; ') || null };
+  if (!o && !m) throw new Error(notes.join('; ') || 'no SIGWX read');
+  [o, m].forEach(x => { if (x) { delete x.summary; x.notes = (x.notes || []).slice(); } });
+  return { official: o, model: m, notes };
+}
 PARTS.nat = { limit: 60, run: async () => {
   const notes = [], live = await req('nat-message.js').fetchNatLive(notes);
   if (!live) throw new Error(notes.join('; ') || 'no track message');
@@ -280,6 +303,13 @@ function finishPart(key, s, win, generatedAt) {
     if (s.lat50wSeen !== undefined) delete s.lat50wSeen;
     s.notes = (s.notes || []).filter(n => !/nat-fixes\.json/.test(n));
   }
+  if (key === 'since.sigwx') {
+    // Only the days of the window; the model part holds analyses only (today's forecast stays in sigwxModel).
+    const inW = d => d >= win.from && d <= win.to;
+    if (s.official) { const n = (s.official.days || []).length; s.official.days = (s.official.days || []).filter(d => inW(d.date)); if (s.official.days.length !== n) emptied.push('sigwx.official.days outside the window'); }
+    if (s.model) Object.keys(s.model.areas || {}).forEach(a => { const A = s.model.areas[a], n = (A.days || []).length;
+      A.days = (A.days || []).filter(d => inW(d.date) && d.kind === 'analysis'); if (A.days.length !== n) emptied.push('sigwx.model.areas.' + a + '.days (outside the window or not an analysis)'); });
+  }
   if (key === 'since.faa') {
     // Belt and braces: no airport code or name, no list of airports under a centre, no centre names.
     (s.airports || []).forEach((a, i) => FAA_PRIVATE.forEach(k => { if (a && k in a) { emptied.push('faa.airports[' + i + '].' + k); delete a[k]; } }));
@@ -393,6 +423,14 @@ function validate(L) {
       (fa.days || []).forEach(d => { if (!inX(d.date)) P.push('since.faa ' + d.date + ' outside its window');
         if (Object.values(d.centers || {}).some(c => c && c.airports)) P.push('since.faa ' + d.date + ': a centre lists its airports'); });
       if (fa.names) P.push('since.faa.names must not be published');
+    }
+    const sx = si.sigwx;
+    if (sx) {
+      if (!sx.official && !sx.model) P.push('since.sigwx needs official or model');
+      if (sx.official && (!Array.isArray(sx.official.days) || sx.official.days.some(d => !inX(d.date) || !Array.isArray(d.features)))) P.push('since.sigwx.official.days must be charts of its window');
+      if (sx.model) ['na', 'atl', 'me'].forEach(a => { const A = sx.model.areas && sx.model.areas[a];
+        if (!A || !Array.isArray(A.days)) P.push('since.sigwx.model.areas.' + a + ' missing');
+        else A.days.forEach(d => { if (!inX(d.date) || d.kind !== 'analysis') P.push('since.sigwx.model ' + a + ' ' + d.date + ' must be an analysis day of its window'); }); });
     }
     if (!SINCE_KEYS.some(k => si[k])) P.push('since has no sub-part (null when all failed)');
     const r = si.wxreview;

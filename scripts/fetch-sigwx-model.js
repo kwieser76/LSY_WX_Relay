@@ -212,11 +212,14 @@ function cbOf(f) {
 // week-ahead forecast files are requested, and areas.*.days hold kind 'forecast' only; `past` keeps its
 // keys with from/to null. The ahead days are the 7 dates after `to` (pass the day before the first one
 // wanted). Absent = unchanged.
-async function fetchSigwxModel({ to, from, backfill, aheadOnly }) {
+// pastOnly (the relay's This-week part, fetchSigwxModelObserved): the analyses of the past days only, no week
+// ahead; dates = the days to read instead of from..to; CAT always with the fixed thresholds, so a day read on
+// one run matches a day read on another. Absent = unchanged.
+async function fetchSigwxModel({ to, from, backfill, aheadOnly, pastOnly, dates }) {
   const t0 = Date.now(), nowMs = Date.now(), notes = [];
   const cfg = (U.readConfig().sigwxModel) || {};
   const cliCal = U.cli(process.argv).argOf('--cat-calibration');
-  const calibration = (cliCal || cfg.catCalibration) === 'percentile' ? 'percentile' : 'fixed';
+  const calibration = !pastOnly && (cliCal || cfg.catCalibration) === 'percentile' ? 'percentile' : 'fixed';
   const forceAws = U.cli(process.argv).has('--archive-only');
   const hits = { [HOST.nomads]: 0, [HOST.aws]: 0 }, bytes = { [HOST.nomads]: 0, [HOST.aws]: 0 }, dead = {};
   const nomadsErrors = [];
@@ -224,13 +227,14 @@ async function fetchSigwxModel({ to, from, backfill, aheadOnly }) {
 
   // The plan: one job per GFS file.
   const jobs = [];
-  (aheadOnly ? [] : daysOf(from, to)).forEach(d => {
+  const pastDays = aheadOnly ? [] : (dates || daysOf(from, to));
+  pastDays.forEach(d => {
     if (Date.parse(d + 'T12:00:00Z') + LAG_H * 36e5 > nowMs) { notes.push('Past week: ' + d + ' 12Z analysis not yet published at run time.'); return; }
     jobs.push({ id: 'ana ' + d, date: d, kind: 'analysis', cycle: D.cycleOf(Date.parse(d + 'T12:00:00Z')), fh: 0, need: { prof: true, cat: true } });
     jobs.push({ id: 'cb ' + d, date: d, kind: 'analysis', cycle: D.cycleOf(Date.parse(d + 'T06:00:00Z')), fh: 6, need: { cb: true } });
   });
   const run = backfill ? D.cycleOf(Date.parse(U.addDays(to, 1) + 'T00:00:00Z')) : D.latestCycle(nowMs, LAG_H);
-  const ahead = D.aheadPlan(run, to, 7, HAZARD_MAX_H);
+  const ahead = pastOnly ? [] : D.aheadPlan(run, to, 7, HAZARD_MAX_H);
   ahead.forEach(p => {
     const cbInFile = p.hazards && p.lead >= 6;
     jobs.push({ id: 'fc ' + p.date, date: p.date, kind: 'forecast', cycle: run, fh: p.lead, need: { prof: true, cat: p.hazards, cb: cbInFile } });
@@ -324,7 +328,7 @@ async function fetchSigwxModel({ to, from, backfill, aheadOnly }) {
   const classesOf = (stat, thr) => D.rleEncode(Array.from(stat, v => (v >= thr[1] ? 2 : v >= thr[0] ? 1 : 0)));
 
   const dayPlan = [];
-  (aheadOnly ? [] : daysOf(from, to)).forEach(d => dayPlan.push({ date: d, kind: 'analysis', prof: 'ana ' + d, cb: 'cb ' + d }));
+  pastDays.forEach(d => dayPlan.push({ date: d, kind: 'analysis', prof: 'ana ' + d, cb: 'cb ' + d }));
   ahead.forEach(p => dayPlan.push({ date: p.date, kind: 'forecast', prof: 'fc ' + p.date, cb: p.hazards ? (p.lead >= 6 ? 'fc ' + p.date : 'cb ' + p.date) : null, plan: p }));
   const areas = {}, missingDays = [];
   AREA_IDS.forEach(a => { const A = AREAS[a]; areas[a] = Object.assign({ name: A.name, box: { s: A.s, n: A.n, w: A.w, e: A.e } }, OG[a], { days: [] }); });
@@ -372,6 +376,7 @@ async function fetchSigwxModel({ to, from, backfill, aheadOnly }) {
     notes,
   };
   if (aheadOnly) out.aheadOnly = true;
+  if (pastOnly) out.pastOnly = true;
   out.seconds = Math.round((Date.now() - t0) / 1000);
   out.snapshotBytes = Buffer.byteLength(JSON.stringify(out));
   const nDays = areas.atl.days.length;
@@ -427,6 +432,55 @@ function digest(s) {
   return L.join('\n');
 }
 
+// ---- This week (the public relay's since.sigwx, 2026-10-13) --------------------------------------
+// The model picture of each day of This week from the GFS 12Z analysis (CB from the 06Z cycle +6 h), as for the
+// briefing week. cache = { prev, next, info } as the relay's other incremental parts: a day is final when every frame
+// has its CAT bands and its CB; a day missing a part is asked for again on the next run. The 12Z analysis is out about
+// 17Z (LAG_H), so today usually joins on the last run of the day; until then the page uses the week-ahead forecast.
+const OBS_CACHE_VERSION = 1;
+const obsFinal = x => !!x && AREA_IDS.every(a => x[a] && x[a].bands && x[a].cb);
+function readObsCache(prev, from, to) {
+  if (!prev || prev.kind !== 'sigwxModel' || prev.version !== OBS_CACHE_VERSION || !prev.days || typeof prev.days !== 'object') return { days: {}, dropped: prev ? 'cache of another kind or version, fresh start' : null };
+  const days = {}; let dropped = 0;
+  Object.keys(prev.days).forEach(d => { const x = prev.days[d]; if (d >= from && d <= to && x && AREA_IDS.every(a => x[a] && x[a].date === d)) days[d] = x; else dropped++; });
+  return { days, dropped: dropped ? dropped + ' day(s) outside the window dropped' : null };
+}
+async function fetchSigwxModelObserved({ from, to, cache, nowMs }) {   // nowMs: tests only
+  const t0 = Date.now(), now = nowMs != null ? nowMs : Date.now(), prev = cache ? readObsCache(cache.prev, from, to) : { days: {}, dropped: null };
+  const out12 = d => Date.parse(d + 'T12:00:00Z') + LAG_H * 36e5 <= now;
+  const all = daysOf(from, to), open = all.filter(d => !obsFinal(prev.days[d])), need = open.filter(out12), got = Object.assign({}, prev.days), notes = [];
+  open.filter(d => !out12(d)).forEach(d => notes.push(d + ': the GFS 12Z analysis is not yet published (about 17Z).'));
+  let r = null, fetched = 0;
+  if (need.length) {
+    try { r = await fetchSigwxModel({ from, to, dates: need, pastOnly: true }); }
+    catch (e) { notes.push('Model SIGWX not read: ' + String(e.message || e).slice(0, 160)); }
+  }
+  if (r) {
+    fetched = Object.values(r.requests).reduce((a, n) => a + n, 0);
+    const by = {}; AREA_IDS.forEach(a => r.areas[a].days.forEach(d => { (by[d.date] = by[d.date] || {})[a] = d; }));
+    // a new read replaces the cached day only when it is at least as complete
+    Object.keys(by).forEach(d => { if (AREA_IDS.every(a => by[d][a]) && (obsFinal(by[d]) || !got[d])) got[d] = by[d]; });
+    r.notes.filter(n => !/^(CAT, CB: up to|Past week: .* not yet published)/.test(n)).forEach(n => notes.push(n));
+  }
+  const dates = all.filter(d => got[d]), missing = all.filter(d => !got[d]);
+  if (!dates.length) throw new Error(notes.join('; ') || 'no GFS analysis for ' + from + ' .. ' + to);
+  const areas = {};
+  AREA_IDS.forEach(a => { const A = AREAS[a]; areas[a] = Object.assign({ name: A.name, box: { s: A.s, n: A.n, w: A.w, e: A.e } }, OG[a], { days: dates.map(d => got[d][a]) }); });
+  if (cache) {
+    const keep = {}; dates.forEach(d => { keep[d] = got[d]; });
+    cache.next = { kind: 'sigwxModel', version: OBS_CACHE_VERSION, days: keep };
+    cache.info = { reused: all.length - open.length, fetched, dropped: prev.dropped };
+  }
+  const seconds = Math.round((Date.now() - t0) / 1000);
+  return { source: 'NOAA GFS 0.5° (NCEP): analyses', label: LABEL, disclaimer: DISCLAIMER, attribution: ATTRIBUTION, pages: PAGES,
+           model: 'GFS 0.5°', res: RES, areaOrder: AREA_IDS,
+           encoding: { cat: 'rle "v*n,v" of classes 0/1/2', trop: 'base64, one byte per point, FL = v*5, 0 = missing', cbExtent: 'rle of CB cover in tenths 0–8', cbTopFL: 'base64 FL/5 of the highest CB top in the cell, 0 = none', jets: 'path [[lat, lon, kt], …] in flow order, 0.1°' },
+           cat: { calibration: 'fixed', thresholds: Object.fromEntries(AREA_IDS.map(a => [a, Object.fromEntries(BANDS.map(b => [b, CAT_FIXED.slice()]))])), units: '1e-7 s^-2', wording: 'potential, never a moderate/severe grade' },
+           past: { from, to, hour: '12Z', kind: 'GFS analyses (f000)' }, areas, missing,
+           requests: r ? r.requests : {}, notes, seconds,
+           summary: [from + ' .. ' + to + ' · ' + dates.length + ' day(s) (' + (all.length - open.length) + ' from the cache) · ' + fetched + ' requests · ' + seconds + ' s'] };
+}
+
 // U.main writes the snapshot pretty-printed; the jet paths would then take four lines a point.
 // Rewritten compactly (temporary name and rename), as BUILD-R4 asks for weather snapshots.
 function rewriteCompact(week) {
@@ -440,7 +494,8 @@ function rewriteCompact(week) {
 }
 
 module.exports = { LABEL, ATTRIBUTION, DISCLAIMER, AREAS, AREA_IDS, WORK, RES, PROFILE, CAT_LEVELS, BANDS, CAT_FIXED, OG,
-                   nomadsSelection, idxWanted, expectedKeys, fieldsOf, jetsOf, tropOf, catOf, cbOf, areaLine, digest, fetchSigwxModel };
+                   nomadsSelection, idxWanted, expectedKeys, fieldsOf, jetsOf, tropOf, catOf, cbOf, areaLine, digest, fetchSigwxModel,
+                   readObsCache, fetchSigwxModelObserved };
 if (require.main === module) {
   const c = U.cli(process.argv);
   U.main(NAME, DIR, fetchSigwxModel, digest).then(() => { if (!c.has('--print-digest') && c.week) rewriteCompact(c.week); });
