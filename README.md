@@ -19,7 +19,8 @@ button, so the map can show newer data than it was built with.
 
 ```
 GitHub Actions, 04:30, 10:30, 16:30 and 22:30 UTC, a backup slot 71 min after each (and on demand);
-  a scheduled run goes ahead only when no latest.json was published since the latest main slot
+  a scheduled run, or one started from outside through the API, goes ahead only when no latest.json was
+  published since the latest main slot; started by hand with "force" ticked it always runs
   branch "data" ──► cache/ (hours already read this week)
   relay.js ── public sources (list below) ──► out/latest.json + out/cache/ ── privacy check ──►
   branch "data": one commit holding latest.json and cache/, force-pushed each run

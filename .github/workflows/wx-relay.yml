@@ -15,8 +15,10 @@
 # Backup slots (2026-10-13): GitHub dropped about one scheduled slot in four and started others up to 5 h late, so each
 # main slot (04:30, 10:30, 16:30, 22:30 UTC) has a backup 71 minutes later. The job "gate" lets a scheduled run go ahead
 # only when the data branch holds no latest.json generated since the latest main slot, so a backup after a main run that
-# published (or a main run that comes after its backup) ends without a request to any source. A run started by hand
-# always runs. The dashboards count a run as published 3 hours after its main slot (WX_RL_RUN, WX_RL_LAG), which covers
+# published (or a main run that comes after its backup) ends without a request to any source. Runs started from outside
+# (cron-job.org calls workflow_dispatch, tools/wx-archive/CRON-JOB-SETUP.md) pass the same gate since 2026-10-13: a job set
+# to every 10 minutes by mistake had started 144 full runs a day. Started by hand with "force" ticked (gh workflow run
+# wx-relay.yml -f force=true) a run always runs. The dashboards count a run as published 3 hours after its main slot (WX_RL_RUN, WX_RL_LAG), which covers
 # the backup.
 name: WX relay
 
@@ -25,6 +27,11 @@ on:
     - cron: "30 4,10,16,22 * * *"
     - cron: "41 5,11,17,23 * * *"
   workflow_dispatch:
+    inputs:
+      force:
+        description: "Run even if a file was already published since the latest main slot (tick when starting by hand)"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -40,13 +47,13 @@ jobs:
     outputs:
       run: ${{ steps.slot.outputs.run }}
     steps:
-      - name: Run only when nothing was published since the latest main slot (scheduled runs; by hand always)
+      - name: Run only when nothing was published since the latest main slot (scheduled and outside runs; by hand with force always)
         id: slot
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -uo pipefail
-          if [ "${{ github.event_name }}" != "schedule" ]; then echo "run=true" >> "$GITHUB_OUTPUT"; echo "Started by hand - runs."; exit 0; fi
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.force }}" = "true" ]; then echo "run=true" >> "$GITHUB_OUTPUT"; echo "Started by hand with force - runs."; exit 0; fi
           now=$(date -u +%s); slot=0
           for back in 0 1; do
             d=$(date -u -d "@$(( now - back * 86400 ))" +%F)
@@ -57,10 +64,10 @@ jobs:
           gs="$(date -u -d "$gen" +%s 2>/dev/null || echo 0)"
           if [ -n "$gen" ] && [ "$gs" -ge "$slot" ]; then
             echo "run=false" >> "$GITHUB_OUTPUT"
-            echo "latest.json of $gen is from after the main slot $(date -u -d "@$slot" +%FT%H:%MZ) - nothing to do (cron ${{ github.event.schedule }})."
+            echo "latest.json of $gen is from after the main slot $(date -u -d "@$slot" +%FT%H:%MZ) - nothing to do (${{ github.event_name }} ${{ github.event.schedule }})."
           else
             echo "run=true" >> "$GITHUB_OUTPUT"
-            echo "No latest.json since the main slot $(date -u -d "@$slot" +%FT%H:%MZ) (found: ${gen:-none}) - runs (cron ${{ github.event.schedule }})."
+            echo "No latest.json since the main slot $(date -u -d "@$slot" +%FT%H:%MZ) (found: ${gen:-none}) - runs (${{ github.event_name }} ${{ github.event.schedule }})."
           fi
 
   relay:
