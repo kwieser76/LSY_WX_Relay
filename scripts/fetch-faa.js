@@ -685,7 +685,7 @@ async function fetchFaa({ from, to, week }) {
 
   const largest = progs.slice().sort((a, b) => b.maxDelay - a.maxDelay).slice(0, 10);
   return {
-    source: { name: 'FAA ATCSCC — Advisories Database', url: FORM },
+    source: { name: 'FAA ATCSCC: Advisories Database', url: FORM },
     days, airports: AIRPORTS,
     totals: { advisories: rows.length, gs: count('gs'), gsCancel: count('gsCancel'), gdp: count('gdp'), gdpProposed: count('gdpProposed'),
               gdpCancel: count('gdpCancel'), afp: count('afp'), ctop: count('ctop'), route: count('route'), swap: count('swap'),
@@ -879,7 +879,7 @@ async function fetchFaaObserved({ from, to, cache, softDeadlineS, nowMs: nowArg,
     cache.info = { reused: n.reused, fetched: n.lists + n.details + n.positions, dropped: prev.dropped };
   }
   const seconds = Math.round((Date.now() - t0) / 1000);
-  return { source: { name: 'FAA ATCSCC — Advisories Database', url: FORM }, licence: 'US Government work, public domain (17 U.S.C. § 105)',
+  return { source: { name: 'FAA ATCSCC: Advisories Database', url: FORM }, licence: 'US Government work, public domain (17 U.S.C. § 105)',
     attribution: 'Source: FAA Air Traffic Control System Command Center advisories (public domain). Not for operational use.',
     positions: positionsUrl ? 'OurAirports airports.csv (public domain), ' + positionsUrl : 'the airport table in fetch-faa.js',
     scope: 'weather restrictions only: per day and ARTCC, and per airport its position (no airport codes or names)',
@@ -967,7 +967,7 @@ function digest(s) {
   L.push('- North Atlantic tracks and West Atlantic closures matter for long-haul operations: report a split or');
   L.push('  unusually northern/southern system, closed entry points and NAT procedure changes where they matter. Volcanic ash');
   L.push('  touches Central and South America routes.');
-  L.push('- Cite as { "name": "FAA ATCSCC — Advisories Database", "url": "' + s.source.url + '", "kind": "news" }, or a single');
+  L.push('- Cite as { "name": "FAA ATCSCC: Advisories Database", "url": "' + s.source.url + '", "kind": "news" }, or a single');
   L.push('  advisory by its own adv_otherdis URL. US government data, public domain.');
   return L.join('\n');
 }

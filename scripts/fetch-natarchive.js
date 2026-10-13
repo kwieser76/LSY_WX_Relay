@@ -177,8 +177,9 @@ function digest(s) {
     L.push('westbound tracks or track coordinates of past days.');
     return L.join('\n');
   }
-  L.push('NAT ARCHIVE — the North Atlantic track message of each day of ' + w.from + '–' + w.to + ' (FAA NAS NAT page, captured twice daily into ' +
-         (s.source && s.source.page) + ')');
+  // Where the copies are kept is ours, not the reader's: the block names only the FAA source (review 2026-10-13, W41 cited
+  // "archived copies in kwieser76/LSY_NAT_Track" as a source).
+  L.push('NAT ARCHIVE: the North Atlantic track message of each day of ' + w.from + '–' + w.to + ' (FAA NAS NAT page, collected twice a day)');
   if (!s.days || !s.days.length) {
     L.push('  No capture covers this week yet (the archive starts later or the capture did not run). Use the US FLOW block for the eastbound');
     L.push('  entry points only; say nothing about westbound tracks or track coordinates of this week.');
@@ -190,7 +191,7 @@ function digest(s) {
   const rem = [];
   s.days.forEach(d => ['eastbound', 'westbound'].forEach(k => ((d[k] && d[k].remarks) || []).forEach(r => { if (!rem.includes(r)) rem.push(r); })));
   if (rem.length) L.push('  Remarks in the messages: ' + rem.slice(0, 4).join(' | ').slice(0, 400));
-  L.push('  CITE: ' + (s.source && s.source.faa) + ' (FAA NAS NAT page; archived copies ' + (s.source && s.source.page) + ').');
+  L.push('  CITE: ' + (s.source && s.source.faa) + ' as "FAA NAS NAT page (daily track messages)". Do not name where the copies are kept.');
   L.push('  HOW TO USE: report an unusually northern or southern system, splits and remarks (closed points, OCR, GNSS) where they matter for');
   L.push('  long-haul planning; a routine week needs one sentence. The dashboards draw the tracks from this block.');
   return L.join('\n');
