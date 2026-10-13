@@ -39,8 +39,10 @@ GitHub Actions, 04:30, 10:30, 16:30 and 22:30 UTC (and on demand)
   nothing; the previous `latest.json` stays. A single source that fails becomes `null` in the file, with
   the reason in `status`.
 - Every request carries the User-Agent `LSY-WX-Relay/1.0 (+https://github.com/kwieser76/LSY_WX_Relay)`.
-  A server that answers HTTP 403 or 429 is not asked again in that run. Hosts are paced as their
-  operators ask (NOMADS: one request a second; AWC: well under 100 a minute).
+  A server that answers HTTP 403 or 429 is not asked again in that run, and not in the runs of the next
+  24 hours either: the refusal is kept in `cache/blocked.json` on the `data` branch (host, status, time), and
+  the run shows as failed while such an entry is in force. Delete the entry to ask again earlier. Hosts are
+  paced as their operators ask (NOMADS: one request a second; AWC: well under 100 a minute).
 - GitHub may start scheduled runs late, and disables scheduled workflows in public repositories after
   60 days without repository activity; re-enable it in the Actions tab if that happens.
 
@@ -153,7 +155,8 @@ node privacy-check.js out/latest.json out/cache    # exit 1 on a finding
 
 Options: `--parts wxoutlook,dust,nat,since` (a subset; `since.gfs` etc. for single sub-parts), `--cache DIR` (the caches of the previous run;
 without it the observed week starts fresh), `--deny-file FILE` (hosts never to contact, first field of each
-line; a 403/429 is appended), `--allow-host HOST`.
+line; a 403/429 is appended), `--allow-host HOST`, `--blocked FILE` (the stop note, default `<cache>/blocked.json`;
+`node relay.js --check-blocked FILE` exits 1 while an entry is in force).
 
 Download per run: the week ahead about 800 requests and 230 MB. The observed week depends on the cache: a
 run with the previous run's cache reads only the hours since then (a few lightning frames and radar files,

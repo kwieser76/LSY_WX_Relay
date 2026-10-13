@@ -214,7 +214,8 @@ async function getBuffer(url, opts) {
       const res = await fetch(url, { signal: ac.signal, redirect: 'follow', headers: { 'User-Agent': U.UA, Accept: 'application/octet-stream' } });
       if (!res.ok) {
         lastErr = 'HTTP ' + res.status;
-        if (res.status >= 400 && res.status < 500 && res.status !== 429) break;
+        // Any 4xx ends it: a 403 or 429 means "leave this host alone" (project rule; review 2026-10-13, L5: a 429 was retried here).
+        if (res.status >= 400 && res.status < 500) break;
         continue;
       }
       return Buffer.from(await res.arrayBuffer());
@@ -241,7 +242,7 @@ async function getRange(url, offset, length, opts) {
       if (res.status !== 206) {
         ac.abort();
         lastErr = 'HTTP ' + res.status + (res.status === 200 ? ' (Range ignored; the whole file was not downloaded)' : '');
-        if (res.status === 200 || (res.status >= 400 && res.status < 500 && res.status !== 429)) break;
+        if (res.status === 200 || (res.status >= 400 && res.status < 500)) break;      // no retry after 403/429 either (L5)
         continue;
       }
       const b = Buffer.from(await res.arrayBuffer());

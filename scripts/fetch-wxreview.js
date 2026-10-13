@@ -26,6 +26,8 @@
 //   Iowa Environmental Mesonet (IEM), Iowa State University:
 //     METAR archive  https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py — one request for
 //                    the hubs of fetch-wxoutlook.js (present weather, visibility, gusts).
+//                    From 2026-10-13 (PO decision, review Q4) for the days the public METAR/TAF archive lacks
+//                    only, and never with the hub list in the URL: see "Hub METARs" below.
 //     SIGMET archive https://mesonet.agron.iastate.edu/cgi-bin/request/gis/sigmets.py — the US
 //                    convective SIGMETs (reissued hourly, so a count is SIGMET-hours) and the US
 //                    oceanic SIGMETs (the US oceanic FIRs of the Atlantic, the Gulf, the Caribbean and the Pacific).
@@ -79,6 +81,8 @@
 // ---------------------------------------------------------------------------
 'use strict';
 
+const fs = require('fs');
+const path = require('path');
 const U = require('./fetch-util.js');
 
 const WX = require('./fetch-wxoutlook.js');      // GRIB2 decoder, binary GET, jet-grid reducer (shared with the outlook)
@@ -750,10 +754,114 @@ function naPirepBlock(rows, window, meta) {
                       max, days } };
 }
 
-// ---- IEM METAR archive: hub weather ---------------------------------------------------------
-function iemMetarUrl(from, to, hubs) {
-  return IEM_METAR + '?' + (hubs || HUBS).map(h => 'station=' + h.icao).join('&') + '&data=wxcodes&data=vsby&data=gust&data=tmpf' +
+// ---- Hub METARs: the public METAR/TAF archive, IEM for the days it lacks -----------------------------
+// PO decision 2026-10-13 (review Q4): the hub list must not appear in any request URL. The hub METARs come from
+// the public archive kwieser76/LSY_WX_Archive (config.json wxReports; every report of 533 large airports, one gzip
+// day file per UTC day, see scripts/capture-wx-reports.js), decoded here and filtered to the hubs locally. A day the
+// archive does not cover (before the capture started on 2026-10-12, or a capture gap) is read from IEM with the
+// archive's own neutral airport list (tools/wx-archive/airports.json), never the hubs. Measured 2026-10-13: the
+// neutral list is a 7.1 KB URL that IEM accepts, ~0.7 MB a day with the four fields below (1.7 MB with the METAR
+// text); a whole IEM network per country would be far larger (every small airfield), so the list is the cheapest
+// neutral form. Until then one IEM request named the hubs.
+const ARCHIVE_AIRPORTS = path.join(__dirname, '..', 'tools', 'wx-archive', 'airports.json');
+function archiveAirports() { try { const a = JSON.parse(fs.readFileSync(ARCHIVE_AIRPORTS, 'utf8')); return Array.isArray(a) ? a : []; } catch (e) { return []; } }
+// stations: ICAO strings or {icao} objects; default the archive's neutral list (never the hubs).
+function iemMetarUrl(from, to, stations, fields) {
+  const list = (stations || archiveAirports()).map(h => (typeof h === 'string' ? h : h.icao));
+  return IEM_METAR + '?' + list.map(icao => 'station=' + icao).join('&') + (fields || ['wxcodes', 'vsby', 'gust', 'tmpf']).map(f => '&data=' + f).join('') +
     '&sts=' + from + 'T00:00:00Z&ets=' + U.addDays(to, 1) + 'T00:00:00Z&tz=Etc/UTC&format=onlycomma&latlon=no&missing=empty&trace=empty&report_type=3&report_type=4';
+}
+// IEM names US, Alaskan, Hawaiian and Puerto Rican stations without their first letter (KXYZ is XYZ). With the neutral
+// list in the request, a three-letter id may only stand for a hub whose ICAO it ends, never for a hub's IATA code.
+function iemHubRows(rows, hubs) {
+  const four = new Set((hubs || HUBS).map(h => h.icao)), three = {};
+  (hubs || HUBS).forEach(h => { if (/^[KPT]/.test(h.icao)) three[h.icao.slice(1)] = h.icao; });
+  return (rows || []).map(r => { const id = String(r.station || '').trim().toUpperCase(); const icao = four.has(id) ? id : three[id];
+    return icao ? Object.assign({}, r, { station: icao }) : null; }).filter(Boolean);
+}
+
+// A METAR or SPECI → { wxcodes: ['-RA', 'BR'], visM, gustKt, tmpC } in the shape IEM's asos.py fields give (wxcodes, vsby,
+// gust, tmpf), or null without a time group. Main body only (up to RMK or the first trend group), except the US RMK
+// T-group (T01230085 = 12.3 °C), which IEM prefers for the temperature. Visibility in metres rounded to 50 like the IEM
+// path (9999 and CAVOK = 10,000 m; statute miles times 1,609 m); a missing //// is null. Gusts in knots (MPS, KMH
+// converted). Checked 2026-10-13 against IEM's own fields on 39,913 METARs of 533 airports (11–12 Oct): present
+// weather 99.98 %, visibility 99.70 %, temperature 99.98 %, gusts 100 % the same; the rest are IEM quirks (weather
+// from a TEMPO group, //// read as 10 km, a COR's weather taken from the original).
+const WX_PHEN = '(?:DZ|RA|SN|SG|IC|PL|GR|GS|UP|BR|FG|FU|VA|DU|SA|HZ|PY|PO|SQ|FC|SS|DS)';
+const WX_TOKEN = new RegExp('^(?:[+-]|VC)?(?:(?:MI|PR|BC|DR|BL|SH|TS|FZ){1,2}' + WX_PHEN + '*|' + WX_PHEN + '+)$');
+const r50 = m => Math.round(m / 50) * 50;
+function decodeMetar(raw) {
+  const toks = String(raw || '').replace(/=+\s*$/, '').trim().split(/\s+/);
+  const out = { wxcodes: [], visM: null, gustKt: null, tmpC: null };
+  let i = 0;
+  while (i < toks.length && !/^\d{6}Z$/.test(toks[i])) i++;            // past METAR/SPECI, COR and the ICAO to the time group
+  if (i >= toks.length) return null;
+  let afterWind = false;
+  for (i = i + 1; i < toks.length; i++) {
+    const t = toks[i];
+    if (/^(RMK|BECMG|TEMPO|NOSIG|PROB\d\d)$/.test(t)) break;
+    let m;
+    if ((m = /^(?:\d{3}|VRB|\/\/\/)(?:\d{2,3}|\/\/)(?:G(\d{2,3}))?(KT|MPS|KMH)$/.exec(t))) {
+      if (m[1]) out.gustKt = Math.round(+m[1] * (m[2] === 'MPS' ? 1.943844 : m[2] === 'KMH' ? 0.539957 : 1));
+      afterWind = true; continue;
+    }
+    if (/^\d{3}V\d{3}$/.test(t)) continue;
+    if (t === 'CAVOK') { if (out.visM == null) out.visM = 10000; continue; }
+    if (out.visM == null) {
+      if ((m = /^([PM])?(\d+)?(?:(\d)\/(\d+))?SM$/.exec(t)) && (m[2] || m[3])) {
+        let v = (m[2] ? +m[2] : 0) + (m[3] ? +m[3] / +m[4] : 0);
+        if (!m[2] && /^\d$/.test(toks[i - 1] || '')) v += +toks[i - 1];          // "1 1/2SM"
+        out.visM = r50(v * 1609.344); continue;
+      }
+      if (/^\d{4}(NDV)?$/.test(t) && afterWind) { out.visM = t.startsWith('9999') ? 10000 : r50(+t.slice(0, 4)); continue; }
+      if (/^\d$/.test(t) && /^\d\/\d+SM$/.test(toks[i + 1] || '')) continue;
+    }
+    if (/^R\d{2}/.test(t) || /^RE/.test(t)) continue;                               // RVR, recent weather
+    if (WX_TOKEN.test(t)) { out.wxcodes.push(t); continue; }
+    if ((m = /^(M?\d{2})\/(M?\d{1,2}|\/{1,3})?$/.exec(t))) out.tmpC = +m[1].replace('M', '-');
+  }
+  const rmk = toks.indexOf('RMK');
+  if (rmk >= 0) {
+    const tg = toks.slice(rmk + 1).find(x => /^T[01]\d{3}([01]\d{3})?$/.test(x));
+    if (tg) out.tmpC = (tg[1] === '1' ? -1 : 1) * +tg.slice(2, 5) / 10;
+  }
+  return out;
+}
+// Archive lines (capture-wx-reports.js: {icao, kind, marks, time 'YYYY-MM-DDTHH:MMZ', raw}) → rows for aggregateMetars,
+// hubs only, METAR and SPECI only. One row per airport and time: a COR replaces the report it corrects (IEM, too, keeps
+// only the corrected one).
+function archiveHubRows(lines, hubs) {
+  const want = new Set((hubs || HUBS).map(h => h.icao)), by = {};
+  (lines || []).forEach(r => {
+    if (!r || !want.has(r.icao) || (r.kind !== 'METAR' && r.kind !== 'SPECI') || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}Z$/.test(r.time || '')) return;
+    const k = r.icao + '|' + r.time, cor = (r.marks || []).indexOf('COR') >= 0;
+    if (by[k] && by[k].cor && !cor) return;
+    by[k] = { r, cor };
+  });
+  return Object.values(by).map(({ r }) => {
+    const d = decodeMetar(r.raw);
+    return d && { station: r.icao, valid: r.time.slice(0, 10) + ' ' + r.time.slice(11, 16), wxcodes: d.wxcodes.join(' '), visM: d.visM, gust: d.gustKt, tmpC: d.tmpC };
+  }).filter(Boolean);
+}
+// Whether the archive covers a day: hub METARs from the first 90 minutes and from the last 90 minutes of it (or, for
+// today, any). A day the capture did not hold from start to end comes from IEM as a whole.
+function archiveCovers(rows, day, isToday) {
+  const ts = rows.filter(r => r.valid.slice(0, 10) === day).map(r => r.valid.slice(11, 16)).sort();
+  return !!ts.length && ts[0] <= '01:30' && (isToday || ts[ts.length - 1] >= '22:30');
+}
+// One archive day file ("YYYY/MM/DD.ndjson.gz") → its lines, or null when the archive does not have it (404).
+// get = the caller's paced GET returning a Buffer; WX_REPORTS_DIR reads a local copy instead (as fetch-wxreports.js).
+async function readArchiveDay(rel, get) {
+  const zlib = require('zlib'), local = process.env.WX_REPORTS_DIR;
+  const parse = buf => (buf.length > 1 && buf[0] === 0x1f && buf[1] === 0x8b ? zlib.gunzipSync(buf) : buf).toString('utf8').split('\n')
+    .map(l => { try { return l.trim() ? JSON.parse(l) : null; } catch (e) { return null; } }).filter(Boolean);
+  if (local) { try { return parse(fs.readFileSync(path.join(local, rel))); } catch (e) { return null; } }
+  const NA = require('./fetch-natarchive.js'), a = (U.readConfig().wxReports) || null;
+  if (!a || a.enabled === false) throw new Error('config.json wxReports is not set');
+  const st = NA.settingsOf({ natArchive: a });
+  if (st.visibility === 'private') throw new Error('the hub METARs read a public archive only');
+  try { return parse(await get(NA.urlOf(st, rel))); }
+  catch (e) { if (/HTTP 404\b/.test(String(e.message))) return null; throw e; }
 }
 // Present-weather groups of one observation. Fog counts FG / FZFG only (BCFG, MIFG, PRFG and VCFG
 // are patches or nearby) or a visibility under 1000 m — unless the hour reports dust or sand, which then
@@ -775,7 +883,8 @@ function wxFlags(wxcodes, visM) {
     hail: t.some(x => /GR|GS/.test(x)),
   };
 }
-// rows: IEM onlycomma rows {station, valid 'YYYY-MM-DD HH:MM' UTC, wxcodes, vsby (statute miles), gust (kt), tmpf (°F)}.
+// rows: IEM onlycomma rows {station, valid 'YYYY-MM-DD HH:MM' UTC, wxcodes, vsby (statute miles), gust (kt), tmpf (°F)},
+// or decoded archive rows with visM (metres) and tmpC (°C) instead of vsby and tmpf (archiveHubRows).
 // Every hub-day also carries dust (hours with dust or sand), haze (hours with haze or smoke and visibility under
 // HUB_T.hazeVisM) and tmaxC (highest temperature reported, °C); they are flagged only for the North America and
 // Middle East hubs, so Europe's notable list reads as before.
@@ -792,14 +901,14 @@ function aggregateMetars(rows, window, hubs) {
     if (!h || !acc[h.code][d]) return;
     const a = acc[h.code][d];
     a.obs++;
-    const vis = r.vsby === '' || r.vsby == null || isNaN(+r.vsby) ? null : Math.round(+r.vsby * 1609.344 / 50) * 50;
+    const vis = 'visM' in r ? r.visM : r.vsby === '' || r.vsby == null || isNaN(+r.vsby) ? null : Math.round(+r.vsby * 1609.344 / 50) * 50;
     const g = r.gust === '' || r.gust == null || isNaN(+r.gust) ? null : Math.round(+r.gust);
     const f = wxFlags(r.wxcodes, vis);
     ['ts', 'fog', 'snow', 'fz', 'hail'].forEach(k => { if (f[k]) a[k].add(hh); });
     const dh = dustHaze(r.wxcodes);
     if (dh.dust) a.dust.add(hh);
     if (dh.haze && vis != null && vis < HUB_T.hazeVisM) a.haze.add(hh);
-    const tc = r.tmpf === '' || r.tmpf == null || isNaN(+r.tmpf) ? null : (+r.tmpf - 32) / 1.8;
+    const tc = 'tmpC' in r ? r.tmpC : r.tmpf === '' || r.tmpf == null || isNaN(+r.tmpf) ? null : (+r.tmpf - 32) / 1.8;
     if (tc != null && (a.tmax == null || tc > a.tmax)) a.tmax = tc;
     if (g != null && (a.gust == null || g > a.gust)) a.gust = g;
     if (vis != null && (a.vis == null || vis < a.vis)) a.vis = vis;
@@ -1051,12 +1160,31 @@ async function fetchWxReview({ from, to }) {
   }
 
   async function otherChain() {
-    out.hubs = await run('iem-metar', 'IEM METAR archive (hubs)', IEM_METAR, PAGES.iemMetar, async () => {
-      const rows = csvObjects(await text(iemMetarUrl(from, to), TIMEOUT_MS.iem));
-      if (!rows.length || !('wxcodes' in rows[0])) throw new Error('no METAR rows in the answer');
+    out.hubs = await run('iem-metar', 'Hub METARs (public METAR/TAF archive; IEM for the days it lacks)', IEM_METAR, PAGES.iemMetar, async src => {
+      const today = new Date(nowMs).toISOString().slice(0, 10), days = daysOf(from, to).filter(d => d <= today);
+      const rows = [], fromArchive = [], fromIem = [], archiveErr = [];
+      for (const d of days) {
+        const rel = d.slice(0, 4) + '/' + d.slice(5, 7) + '/' + d.slice(8, 10) + '.ndjson.gz';
+        let lines = null;
+        try { lines = await readArchiveDay(rel, url => req(url, () => WX.getBuffer(url, { timeoutMs: TIMEOUT_MS.iem }))); }
+        catch (e) { archiveErr.push(d + ' (' + clip(String(e.message || e).replace(/^https?:\/\/\S+: /, ''), 60) + ')'); }
+        const dayRows = lines ? archiveHubRows(lines, HUBS).filter(r => r.valid.slice(0, 10) === d) : [];
+        if (archiveCovers(dayRows, d, d === today)) { rows.push(...dayRows); fromArchive.push(d); } else fromIem.push(d);
+      }
+      if (fromIem.length) {
+        const list = archiveAirports();
+        if (!list.length) throw new Error('tools/wx-archive/airports.json missing: IEM is never asked with the hub list');
+        const iem = iemHubRows(csvObjects(await text(iemMetarUrl(fromIem[0], fromIem[fromIem.length - 1], list), TIMEOUT_MS.iem)), HUBS);
+        rows.push(...iem.filter(r => fromIem.indexOf(String(r.valid).slice(0, 10)) >= 0));
+      }
+      src.days = { archive: fromArchive, iem: fromIem };
+      if (!rows.length) throw new Error('no hub METAR in the archive or the IEM answer');
       const r = aggregateMetars(rows, window);
       if (r.missing.length === HUBS.length) throw new Error('none of the ' + HUBS.length + ' hubs in the answer');
-      if (r.missing.length) notes.push('IEM METAR: no observations for ' + r.missing.join(', '));
+      r.source = { archiveDays: fromArchive, iemDays: fromIem };
+      if (fromIem.length && fromArchive.length) notes.push('Hub METARs: ' + fromArchive.length + ' day(s) from the public METAR/TAF archive, ' + fromIem.length + ' from IEM (' + fromIem.join(', ') + ')');
+      if (archiveErr.length) notes.push('Hub METARs: archive day file(s) not read — ' + archiveErr.join(', '));
+      if (r.missing.length) notes.push('Hub METARs: no observations for ' + r.missing.join(', '));
       return r;
     });
     out.us = await run('iem-sigmet', 'IEM SIGMET archive (US convective + oceanic)', IEM_SIGMET, PAGES.iemSigmet, async () => {
@@ -1502,6 +1630,7 @@ module.exports = { NAT_FIRS, CENTRAL_FIRS, HUBS, HUB_T, REGION_NAMES, PAGES, SIG
                    sigmetDays, feedGaps, gapNote, sigmetDayLine, PIREP_BBOX, PIREP_CAP, PIREP_BOXES, PIREP_FIELDS, PIREP_ATTRIBUTION, pirepUrl, pirepSev,
                    pirepRows, pirepCounts, pirepBlock, pirepLine,
                    firLabel, volcanoName, cycloneName, aggregateSigmets, iemMetarUrl, wxFlags, aggregateMetars, iemSigmetUrl, oceanicHazard,
+                   archiveAirports, iemHubRows, decodeMetar, archiveHubRows, archiveCovers, readArchiveDay,
                    aggregateIemSigmets, parseSpcCsv, summarizeSpc, dayRanges, digest,
                    AREA_FIRS, AREA_SIGMET_GRID, COUNT_HAZARDS, FIR_ALIAS, GFS_BOX, hazardOf, ringTouches, areasOf, areaCounts, areaSigmet, parseIemKml, iemConvective,
                    withConvective, iemPirepUrl, iemSev, iemPirepRows, naPirepBlock, NA_PIREP_BOXES, spcPoints, wxCodes, dustHaze, addAreaLayers,

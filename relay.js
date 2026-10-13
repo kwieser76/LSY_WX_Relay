@@ -6,7 +6,8 @@
 // latest.json, for a weather map that offers a "refresh" button. Run by the GitHub Actions workflow
 // (.github/workflows/wx-relay.yml) four times a day; node 20, no dependencies.
 //
-//   node relay.js [--out DIR] [--cache DIR] [--parts wxoutlook,sigwx,…,nat,since] [--deny-file FILE] [--allow-host HOST]
+//   node relay.js [--out DIR] [--cache DIR] [--parts wxoutlook,sigwx,…,nat,since] [--deny-file FILE] [--allow-host HOST] [--blocked FILE]
+//   node relay.js --check-blocked FILE      exit 1 while the stop note FILE holds an entry in force (the workflow's last step)
 //
 // Seven parts, run one after another (so two parts never hit the same server at the same time), each with
 // its own time limit. A part that fails or runs out of time becomes null with its error in status; the
@@ -45,6 +46,11 @@
 // and stops a host for the rest of the run after HTTP 403 or 429 (no retry, no other path). --deny-file
 // names a file of hosts never to contact (first field of each line, "host · …"; re-read before every
 // request); a 403/429 is appended to it. --allow-host exempts a host listed there.
+// The stop note (2026-10-13): a 403/429 is also kept ACROSS runs. --blocked FILE (default <cache>/blocked.json, restored
+// from the data branch) lists { host, status, at, until, path, part } per refusal; a host in force (BLOCK_HOURS after
+// the refusal) is not contacted, and the run writes the entries still in force to <out>/cache/blocked.json, published
+// with latest.json, so the next run respects them too. Until then a refusing host was asked again at the next run, four
+// times a day. The workflow ends red while an entry is in force (--check-blocked), so a refusal is noticed.
 //
 // latest.json (schema "lsy-wx-relay/1"): { schema, generatedAt, relayRun {id, url}, window {from, to},
 // parts {wxoutlook, sigwx, sigwxModel, gefscat, dust, nat, since} (each the same structure as the fetcher's
@@ -66,6 +72,7 @@ const SINCE_KEYS = ['wxreview', 'lightning', 'mrms', 'nat', 'gfs', 'faa'];
 const SINCE_EXT = ['nat', 'gfs', 'faa'];
 const MIN_DAYS = 3;
 const FAA_PRIVATE = ['faa', 'icao', 'code', 'name', 'iata'];
+const BLOCK_HOURS = 24;
 const DISCLAIMER = 'MODEL AND FORECAST DATA, NOT FOR OPERATIONAL USE. Not a flight-planning, dispatch or pilot-briefing product and not an ' +
   'official meteorological service: for operations use the approved sources (WAFC charts via SADIS/WIFS, SIGMETs, national meteorological ' +
   'services). Model-derived layers are computed by this relay and are not official products; days 4–7 are low confidence. Every part carries ' +
@@ -160,10 +167,34 @@ function denyList(file) {
       .map(l => l.split(' · ')[0].trim()).filter(h => /^[a-z0-9.-]+\.[a-z]{2,}$/i.test(h));
   } catch (e) { return []; }
 }
+// The stop note: { blocked: [{ host, status, at, until, path, part }] }. Entries in force at nowMs; a missing or broken
+// file is no note.
+function readBlocked(file) { try { const j = JSON.parse(fs.readFileSync(file, 'utf8')); return Array.isArray(j && j.blocked) ? j.blocked : []; } catch (e) { return []; } }
+const inForce = (entries, nowMs) => (entries || []).filter(b => b && b.host && Date.parse(b.until || '') > nowMs);
+function blockedNote(entries) {
+  return { _comment: 'Stop note of the relay: a host that answered HTTP 403/429 is not contacted until "until". Delete an entry (or the file) ' +
+    'on the data branch to ask again earlier.', blocked: entries };
+}
+// Every header value of a request, whatever form the caller used: init.headers as a Headers object, an array of
+// pairs or a plain object (any case), and the headers of a Request passed as input (review 2026-10-13, L9).
+function headerValues(input, init) {
+  const out = [];
+  const add = hd => {
+    if (!hd) return;
+    if (typeof hd.forEach === 'function' && typeof hd.get === 'function') hd.forEach((v, k) => out.push([String(k).toLowerCase(), String(v)]));
+    else if (Array.isArray(hd)) hd.forEach(p => { if (p && p.length >= 2) out.push([String(p[0]).toLowerCase(), String(p[1])]); });
+    else if (typeof hd === 'object') Object.keys(hd).forEach(k => out.push([k.toLowerCase(), String(hd[k])]));
+  };
+  if (input && typeof input === 'object' && input.headers) add(input.headers);
+  if (init && init.headers) add(init.headers);
+  return out;
+}
+const EMAIL_RE = /[^\s@()<>,;:"]+@[^\s@()<>,;:"]+\.[a-z]{2,}/i;
+
 function installFetch(opts) {
-  const o = Object.assign({ denyFile: null, allow: [], log: () => {} }, opts || {});
-  const orig = globalThis.fetch, stats = {}, stopped = {};
-  const S = part => stats[part] || (stats[part] = { requests: 0, bytes: 0, hosts: {} });
+  const o = Object.assign({ denyFile: null, allow: [], log: () => {}, blocked: [], nowMs: Date.now() }, opts || {});
+  const orig = globalThis.fetch, stats = Object.create(null), stopped = Object.create(null), blocks = inForce(o.blocked, o.nowMs).map(b => Object.assign({}, b));
+  const S = part => stats[part] || (stats[part] = { requests: 0, bytes: 0, hosts: Object.create(null) });
   const H = (part, host) => { const s = S(part); return s.hosts[host] || (s.hosts[host] = { requests: 0, bytes: 0, status: {}, refused: 0 }); };
   globalThis.fetch = async function relayFetch(input, init) {
     const url = typeof input === 'string' ? input : (input && input.url) || String(input);
@@ -175,9 +206,15 @@ function installFetch(opts) {
       H(cx.part, host).refused++;
       throw new Error('relay: ' + host + ' is on the deny list (HTTP 403 rule); not contacted');
     }
-    // The relay's own identity only: a request whose User-Agent carries an e-mail address (the project's private one) is not sent.
-    const hd = init && init.headers, ua = hd ? (typeof hd.get === 'function' ? hd.get('user-agent') : (hd['User-Agent'] || hd['user-agent'])) : null;
-    if (ua && /[^\s@()]+@[^\s@()]+\.[a-z]{2,}/i.test(String(ua))) { H(cx.part, host).refused++; throw new Error('relay: request to ' + host + ' not sent — its User-Agent carries an e-mail address'); }
+    const note = !o.allow.includes(host) && blocks.find(b => b.host === host);
+    if (note) {
+      H(cx.part, host).refused++;
+      throw new Error('relay: ' + host + ' answered HTTP ' + note.status + ' at ' + String(note.at).slice(0, 16) + 'Z; stop note in force until ' + String(note.until).slice(0, 16) + 'Z; not contacted');
+    }
+    // The relay's own identity only: a request with an e-mail address in any header (the project's private one in its
+    // User-Agent, above all) is not sent.
+    const mail = headerValues(input, init).find(([, v]) => EMAIL_RE.test(v));
+    if (mail) { H(cx.part, host).refused++; throw new Error('relay: request to ' + host + ' not sent — its ' + (mail[0] === 'user-agent' ? 'User-Agent' : mail[0] + ' header') + ' carries an e-mail address'); }
     const h = H(cx.part, host);
     h.requests++; S(cx.part).requests++;
     const res = await orig(input, init);
@@ -185,6 +222,7 @@ function installFetch(opts) {
     if (res.status === 403 || res.status === 429) {
       const p = new URL(url).pathname;
       stopped[host] = { status: res.status, path: p, at: new Date().toISOString(), part: cx.part };
+      blocks.push({ host, status: res.status, at: stopped[host].at, until: new Date(Date.parse(stopped[host].at) + BLOCK_HOURS * 3600000).toISOString(), path: p, part: cx.part });
       o.log('relay: ' + host + ' answered HTTP ' + res.status + ' on ' + p + ' — stopped for the rest of the run');
       if (o.denyFile) { try { fs.appendFileSync(o.denyFile, host + ' · ' + stopped[host].at.slice(0, 19) + 'Z · ' + p + ' · ' + res.status + ' · wx-relay (' + cx.part + ')\n'); } catch (e) { /* keep going */ } }
     }
@@ -194,7 +232,7 @@ function installFetch(opts) {
     h.bytes += buf.byteLength; S(cx.part).bytes += buf.byteLength;
     return new Response(buf, { status: res.status, statusText: res.statusText, headers: res.headers });
   };
-  return { stats, stopped, restore: () => { globalThis.fetch = orig; } };
+  return { stats, stopped, blocks, restore: () => { globalThis.fetch = orig; } };
 }
 
 // ---- one part ------------------------------------------------------------------------------------
@@ -432,7 +470,10 @@ async function main(argv) {
   const sw = sinceWindowOf(t0), xw = extWindowOf(sw), cacheDir = arg('--cache') ? path.resolve(arg('--cache')) : null;
   log('relay: window ' + win.from + ' .. ' + win.to + ' · since ' + sw.from + ' .. ' + sw.asOf.slice(0, 16) + 'Z (' + sw.week + ')' +
       (xw.from !== sw.from ? ', ' + SINCE_EXT.join('/') + ' from ' + xw.from : '') + (only ? ' · parts ' + only.join(',') : ''));
-  const net = installFetch({ denyFile: arg('--deny-file'), allow, log });
+  const blockedFile = arg('--blocked') ? path.resolve(arg('--blocked')) : cacheDir ? path.join(cacheDir, 'blocked.json') : null;
+  const prevBlocks = blockedFile ? inForce(readBlocked(blockedFile), t0) : [];
+  prevBlocks.forEach(b => log('relay: stop note — ' + b.host + ' answered HTTP ' + b.status + ' at ' + String(b.at).slice(0, 16) + 'Z, not contacted until ' + String(b.until).slice(0, 16) + 'Z'));
+  const net = installFetch({ denyFile: arg('--deny-file'), allow, log, blocked: prevBlocks, nowMs: t0 });
   const results = {}, caches = {};
   const one = async (k, w, limit, fn, fin) => {
     const r = await runPart(k, w, limit, fn), s = net.stats[k] || { requests: 0, bytes: 0, hosts: {} };
@@ -466,6 +507,13 @@ async function main(argv) {
     }
   }
   net.restore();
+  // The stop note goes out on every path, also when nothing else is written (the workflow then publishes it alone).
+  const putNote = () => {
+    if (!net.blocks.length) return;
+    fs.mkdirSync(path.join(outDir, 'cache'), { recursive: true });
+    fs.writeFileSync(path.join(outDir, 'cache', 'blocked.json'), JSON.stringify(blockedNote(net.blocks), null, 1) + '\n');
+    log('relay: stop note → cache/blocked.json (' + net.blocks.map(b => b.host + ' HTTP ' + b.status + ' until ' + String(b.until).slice(0, 16) + 'Z').join(', ') + ')');
+  };
   const L = assemble(win, generatedAt, results, process.env, sw);
   const problems = validate(L), errors = problems.filter(p => !/^warn:/.test(p));
   problems.forEach(p => log('relay: contract ' + (/^warn:/.test(p) ? '' : 'PROBLEM ') + p));
@@ -476,11 +524,11 @@ async function main(argv) {
   log('relay: latest.json ' + Math.round(text.length / 1024) + ' KB · ' + Math.round((Date.now() - t0) / 1000) + ' s · ' +
       Object.values(results).reduce((s, r) => s + (r.requests || 0), 0) + ' requests · ' +
       Math.round(Object.values(results).reduce((s, r) => s + (r.megabytes || 0), 0) * 10) / 10 + ' MB');
-  if (bad || errors.length) { log('relay: FAILED — ' + (bad ? 'privacy check' : 'contract') + '; nothing written, the published file stays as it was'); return 1; }
+  if (bad || errors.length) { putNote(); log('relay: FAILED — ' + (bad ? 'privacy check' : 'contract') + '; nothing written, the published file stays as it was'); return 1; }
   // The caches are published too (data branch): the same privacy check, built-in rules (they hold grids only).
   const cacheTexts = Object.entries(caches).filter(([, c]) => c).map(([k, c]) => [cacheName(k, SINCE[k].weekly === false ? null : sw.week), JSON.stringify(c)]);
   const cbad = PC.report([].concat(...cacheTexts.map(([n, t]) => PC.checkText('cache/' + n, t, terms))), cacheTexts.length, !!terms);
-  if (cbad) { log('relay: FAILED — privacy check of the caches; nothing written'); return 1; }
+  if (cbad) { putNote(); log('relay: FAILED — privacy check of the caches; nothing written'); return 1; }
   fs.mkdirSync(outDir, { recursive: true });
   const put = (p, t) => { const tmp = p + '.tmp-' + process.pid; fs.writeFileSync(tmp, t); fs.renameSync(tmp, p); };
   const p = path.join(outDir, 'latest.json');
@@ -489,13 +537,24 @@ async function main(argv) {
     fs.mkdirSync(path.join(outDir, 'cache'), { recursive: true });
     cacheTexts.forEach(([n, t]) => put(path.join(outDir, 'cache', n), t));
   }
+  putNote();
   log('relay: → ' + p + ' (' + PART_KEYS.filter(k => L.parts[k]).length + '/' + PART_KEYS.length + ' parts)' +
       (cacheTexts.length ? ' + ' + cacheTexts.map(([n, t]) => 'cache/' + n + ' ' + Math.round(t.length / 1024) + ' KB').join(', ') : ''));
   return 0;
 }
 
-module.exports = { SCHEMA, PART_KEYS, SINCE_KEYS, SINCE_EXT, MIN_DAYS, ATTRIBUTION, ATTRIBUTION_SINCE, DISCLAIMER, windowOf, sinceWindowOf, extWindowOf, isoWeekOf,
-                   finishPart, validate, assemble, loadCache, cacheName, installFetch, denyList, main };
+// --check-blocked FILE: 1 (with a GitHub error line per entry) while the stop note holds an entry in force, else 0.
+function checkBlocked(file, nowMs) {
+  const act = inForce(readBlocked(file), nowMs == null ? Date.now() : nowMs);
+  act.forEach(b => console.log('::error title=WX relay::' + b.host + ' answered HTTP ' + b.status + ' at ' + String(b.at).slice(0, 16) + 'Z (' + (b.part || '?') +
+    ') — not contacted until ' + String(b.until).slice(0, 16) + 'Z (cache/blocked.json on the data branch; delete the entry to ask again earlier)'));
+  if (!act.length) console.log('relay: no stop note in force.');
+  return act.length ? 1 : 0;
+}
+
+module.exports = { SCHEMA, PART_KEYS, SINCE_KEYS, SINCE_EXT, MIN_DAYS, BLOCK_HOURS, ATTRIBUTION, ATTRIBUTION_SINCE, DISCLAIMER, windowOf, sinceWindowOf, extWindowOf, isoWeekOf,
+                   finishPart, validate, assemble, loadCache, cacheName, installFetch, denyList, readBlocked, inForce, blockedNote, headerValues, checkBlocked, main };
+if (require.main === module && process.argv[2] === '--check-blocked') process.exit(checkBlocked(process.argv[3]));
 if (require.main === module) {
   if (!fs.existsSync(path.join(SCRIPTS, 'fetch-util.js'))) {
     console.log('relay: scripts/ not found next to relay.js — run the packaged copy (node tools/wx-relay/package.js, then dist/relay.js).');

@@ -9,6 +9,9 @@
 # cache of the old week (gfs.json and faa.json keep only the days of the current window).
 # relay.js exits 1 without writing when every part failed or the privacy check finds something; the
 # publish step then does not run and the previous latest.json and caches stay in place.
+# Stop note (2026-10-13): a host that answered HTTP 403/429 is written to cache/blocked.json and not contacted for 24 h by
+# the following runs; the last step turns the run red while such an entry is in force. When the relay itself failed, the
+# note is still published (next to the previous latest.json and caches), so the next run does not ask that host again.
 name: WX relay
 
 on:
@@ -51,7 +54,7 @@ jobs:
           ls -l "$RUNNER_TEMP/cache"
 
       - name: Fetch the data and write out/latest.json and out/cache/
-        run: node relay.js --out out --cache "$RUNNER_TEMP/cache"
+        run: node relay.js --out out --cache "$RUNNER_TEMP/cache" --blocked "$RUNNER_TEMP/cache/blocked.json"
 
       - name: Privacy check of the output
         run: node privacy-check.js out/latest.json $(ls -d out/cache 2>/dev/null)
@@ -74,3 +77,25 @@ jobs:
           fi
           git commit -q -m "latest.json $(date -u +%Y-%m-%dT%H:%MZ)"
           git push --force origin HEAD:refs/heads/data
+
+      - name: Keep a new stop note although the relay failed (the previous files stay, plus cache/blocked.json)
+        if: failure() && hashFiles('out/cache/blocked.json') != '' && hashFiles('out/latest.json') == ''
+        run: |
+          set -euo pipefail
+          node privacy-check.js out/cache/blocked.json
+          cp out/cache/blocked.json "$RUNNER_TEMP/blocked.json"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch --orphan data-note
+          if git rev-parse -q --verify FETCH_HEAD >/dev/null; then git checkout FETCH_HEAD -- . ; fi
+          mkdir -p cache
+          cp "$RUNNER_TEMP/blocked.json" cache/blocked.json
+          git add cache/blocked.json
+          git commit -q -m "stop note $(date -u +%Y-%m-%dT%H:%MZ)"
+          git push --force origin HEAD:refs/heads/data
+
+      # After the publish the work tree is the orphan data commit (out/ stays, it is not tracked): back to main for relay.js.
+      - name: Fail the run while a stop note is in force (a host answered HTTP 403/429 in the last 24 h)
+        run: |
+          git switch -q main
+          if [ -f out/cache/blocked.json ]; then node relay.js --check-blocked out/cache/blocked.json; else echo "relay: no stop note in force."; fi

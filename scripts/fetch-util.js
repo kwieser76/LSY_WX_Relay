@@ -100,7 +100,10 @@ function readConfig() {
 // slow source answering just inside each one — NVD with three retries on five products — could still
 // hold the Monday run for many minutes. Past the ceiling the fetcher gives up, writes nothing, and the
 // run carries on with the fallback text.
-const MAX_SECONDS = { 'fetch-security': 300, 'fetch-faa': 600, 'fetch-linkedin': 420, 'fetch-wxoutlook': 300, 'fetch-wxreview': 300, 'fetch-lightning': 420, 'fetch-hiring': 420, 'fetch-mrms': 420, 'fetch-eccc-lightning': 300, 'fetch-dust': 240, 'fetch-sigwx': 240, 'fetch-sigwx-model': 300, 'fetch-gefs-cat': 240 };
+// fetch-nop and fetch-wxreports (review 2026-10-13): their worst case is above the default 180 s — the NOP PDF (90 s)
+// plus pdftotext (60 s, pypdf 120 s) plus the watched pages; nine day files of 30 s plus the IEM gap filler.
+const MAX_SECONDS = { 'fetch-security': 300, 'fetch-faa': 600, 'fetch-linkedin': 420, 'fetch-wxoutlook': 300, 'fetch-wxreview': 300, 'fetch-lightning': 420, 'fetch-hiring': 420, 'fetch-mrms': 420, 'fetch-eccc-lightning': 300, 'fetch-dust': 240, 'fetch-sigwx': 240, 'fetch-sigwx-model': 300, 'fetch-gefs-cat': 240,
+                      'fetch-nop': 420, 'fetch-wxreports': 360 };
 async function main(name, dir, fetchFn, digestFn) {
   const c = cli(process.argv);
   if (!c.has('--print-digest')) {
