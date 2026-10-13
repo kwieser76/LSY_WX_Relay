@@ -12,11 +12,18 @@
 # Stop note (2026-10-13): a host that answered HTTP 403/429 is written to cache/blocked.json and not contacted for 24 h by
 # the following runs; the last step turns the run red while such an entry is in force. When the relay itself failed, the
 # note is still published (next to the previous latest.json and caches), so the next run does not ask that host again.
+# Backup slots (2026-10-13): GitHub dropped about one scheduled slot in four and started others up to 5 h late, so each
+# main slot (04:30, 10:30, 16:30, 22:30 UTC) has a backup 71 minutes later. The job "gate" lets a scheduled run go ahead
+# only when the data branch holds no latest.json generated since the latest main slot, so a backup after a main run that
+# published (or a main run that comes after its backup) ends without a request to any source. A run started by hand
+# always runs. The dashboards count a run as published 3 hours after its main slot (WX_RL_RUN, WX_RL_LAG), which covers
+# the backup.
 name: WX relay
 
 on:
   schedule:
     - cron: "30 4,10,16,22 * * *"
+    - cron: "41 5,11,17,23 * * *"
   workflow_dispatch:
 
 permissions:
@@ -27,7 +34,38 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    outputs:
+      run: ${{ steps.slot.outputs.run }}
+    steps:
+      - name: Run only when nothing was published since the latest main slot (scheduled runs; by hand always)
+        id: slot
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          if [ "${{ github.event_name }}" != "schedule" ]; then echo "run=true" >> "$GITHUB_OUTPUT"; echo "Started by hand - runs."; exit 0; fi
+          now=$(date -u +%s); slot=0
+          for back in 0 1; do
+            d=$(date -u -d "@$(( now - back * 86400 ))" +%F)
+            for h in 22 16 10 04; do s=$(date -u -d "$d $h:30" +%s); if [ "$s" -le "$now" ]; then slot=$s; break 2; fi; done
+          done
+          # No answer (no data branch, GitHub API down) = run: a backup must never be skipped for want of a check.
+          gen="$(gh api -H "Accept: application/vnd.github.raw" "repos/${{ github.repository }}/contents/latest.json?ref=data" 2>/dev/null | jq -r '.generatedAt // empty' 2>/dev/null || true)"
+          gs="$(date -u -d "$gen" +%s 2>/dev/null || echo 0)"
+          if [ -n "$gen" ] && [ "$gs" -ge "$slot" ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "latest.json of $gen is from after the main slot $(date -u -d "@$slot" +%FT%H:%MZ) - nothing to do (cron ${{ github.event.schedule }})."
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "No latest.json since the main slot $(date -u -d "@$slot" +%FT%H:%MZ) (found: ${gen:-none}) - runs (cron ${{ github.event.schedule }})."
+          fi
+
   relay:
+    needs: gate
+    if: needs.gate.outputs.run == 'true'
     runs-on: ubuntu-latest
     # 60, not 40 (2026-10-12): the This-week parts (since.nat/gfs/faa) raised the worst case to ~38 min; a public repo
     # pays nothing for minutes, and a run killed at the limit publishes nothing at all.
