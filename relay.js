@@ -28,7 +28,7 @@
 //               and, from 2026-10-12, over at least the last 3 days (on Monday from Saturday, on Tuesday from Sunday):
 //               nat       the North Atlantic tracks of every day, both directions (public NAT archive LSY_NAT_Track,
 //                         scripts/fetch-natarchive.js)
-//               gfs       GFS 00Z analyses: jet at 250 hPa (FL340) and the flight-level grids (tropopause, max-wind
+//               gfs       GFS 00Z analyses: jet at 300/250/200 hPa (FL300/340/390, all three since 2026-10-13) and the flight-level grids (tropopause, max-wind
 //                         level, freezing level), three map frames (scripts/fetch-wxreview.js fetchGfsObserved)
 //               faa       FAA Command Center weather restrictions per day and ARTCC, airports as positions only
 //                         (scripts/fetch-faa.js fetchFaaObserved; positions from OurAirports)
@@ -109,7 +109,17 @@ const ATTRIBUTION_SINCE = {
 // Part limits (s). The fetchers stop starting requests well before (soft deadlines 90–240 s); the sum plus 60 s is
 // the whole run's limit (2265 s with the 2026-10-12 sub-parts), under the workflow's job timeout of 40 min.
 const PARTS = {
-  wxoutlook: { limit: 240, run: () => req('fetch-wxoutlook.js').fetchWxOutlook({ hubs: [] }) },
+  // 2026-10-13 (ADR-001 Q3): the ECMWF ENS hub probabilities as values at neutral grid points (scripts/ens-points.js: the
+  // airports of the public METAR archive's rule, read from OurAirports each run, published as grid indices only); without
+  // OurAirports the part runs as before, without them.
+  wxoutlook: { limit: 240, run: async () => {
+    let pts = null, note = null;
+    try { pts = req('ens-points.js').neutralPositions(await req('fetch-util.js').getText(req('fetch-faa.js').OURAIRPORTS_CSV, { accept: 'text/csv', timeoutMs: 60000, retries: 1 })); }
+    catch (e) { note = 'ECMWF ENS points: OurAirports not read (' + String(e.message || e).slice(0, 80) + '); hub probabilities left out'; }
+    const s = await req('fetch-wxoutlook.js').fetchWxOutlook({ hubs: [], ensPoints: pts && pts.length > 100 ? pts : null });
+    if (note) s.notes = (s.notes || []).concat([note]);
+    return s;
+  } },
   sigwx: { limit: 240, run: w => req('fetch-sigwx.js').fetchSigwx({ from: w.from, to: w.to, aheadOnly: true }) },
   sigwxModel: { limit: 240, run: w => req('fetch-sigwx-model.js').fetchSigwxModel({ from: w.prev, to: w.prev, aheadOnly: true }) },
   gefscat: { limit: 240, run: w => req('fetch-gefs-cat.js').fetchGefsCat({ to: w.prev }) },
@@ -413,8 +423,14 @@ function validate(L) {
       P.push('since.nat.days must be days of its window with tracks per direction');
     const gf = si.gfs;
     if (gf) {
-      if (!gf.jet || !Array.isArray(gf.jet.days) || JSON.stringify(gf.jet.levels) !== '["250"]') P.push('since.gfs.jet must hold the 250 hPa (FL340) days only');
-      [gf.jet, gf.levels].forEach(o => ((o && o.days) || []).forEach(d => { if (!inX(d.date)) P.push('since.gfs ' + d.date + ' outside its window'); }));
+      // 2026-10-13: the three jet levels of the weekly run (FL300/340/390), 250 hPa in days, the others in byLevel
+      if (!gf.jet || !Array.isArray(gf.jet.days) || JSON.stringify(gf.jet.levels) !== '["300","250","200"]') P.push('since.gfs.jet must hold the 300, 250 and 200 hPa levels (FL300/340/390)');
+      const lv = o => [o].concat(Object.values((o && o.byLevel) || {}));
+      // every grid string of exactly nlat x nlon bytes, as the page checks it (wxRlSince3)
+      const b64n = g => 4 * Math.ceil(g.nlat * g.nlon / 3), okB = (g, v) => v == null || (typeof v === 'string' && v.length === b64n(g));
+      [gf.jet].concat(Object.values((gf.jet && gf.jet.areas) || {})).filter(Boolean).forEach(g => lv(g).forEach(o => ((o && o.days) || []).forEach(d => {
+        if (!okB(g, d.kt)) P.push('since.gfs jet ' + d.date + ': grid of the wrong length'); })));
+      [].concat(lv(gf.jet), [gf.levels]).forEach(o => ((o && o.days) || []).forEach(d => { if (!inX(d.date)) P.push('since.gfs ' + d.date + ' outside its window'); }));
     }
     const fa = si.faa;
     if (fa) {
@@ -427,10 +443,13 @@ function validate(L) {
     const sx = si.sigwx;
     if (sx) {
       if (!sx.official && !sx.model) P.push('since.sigwx needs official or model');
-      if (sx.official && (!Array.isArray(sx.official.days) || sx.official.days.some(d => !inX(d.date) || !Array.isArray(d.features)))) P.push('since.sigwx.official.days must be charts of its window');
+      // the same rules as the page (wxRlSince3, 2026-10-13): a chart the relay publishes must not be dropped by the reader
+      const ts = v => typeof v === 'string' && /^\d{4}-\d\d-\d\dT\d\d/.test(v), num = v => typeof v === 'number' && isFinite(v);
+      if (sx.official && (!Array.isArray(sx.official.days) || sx.official.days.some(d => !inX(d.date) || !Array.isArray(d.features) || !ts(d.valid) || !num(d.lead)))) P.push('since.sigwx.official.days must be charts of its window with valid time and lead');
       if (sx.model) ['na', 'atl', 'me'].forEach(a => { const A = sx.model.areas && sx.model.areas[a];
         if (!A || !Array.isArray(A.days)) P.push('since.sigwx.model.areas.' + a + ' missing');
-        else A.days.forEach(d => { if (!inX(d.date) || d.kind !== 'analysis') P.push('since.sigwx.model ' + a + ' ' + d.date + ' must be an analysis day of its window'); }); });
+        else if (!(A.nlat > 0 && A.nlon > 0 && num(A.lat0) && num(A.lon0) && num(A.res))) P.push('since.sigwx.model.areas.' + a + ' grid missing');
+        else A.days.forEach(d => { if (!inX(d.date) || d.kind !== 'analysis' || !ts(d.valid) || !Array.isArray(d.jets)) P.push('since.sigwx.model ' + a + ' ' + d.date + ' must be an analysis day of its window with valid time and jets'); }); });
     }
     if (!SINCE_KEYS.some(k => si[k])) P.push('since has no sub-part (null when all failed)');
     const r = si.wxreview;

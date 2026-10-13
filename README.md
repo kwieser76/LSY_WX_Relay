@@ -68,7 +68,7 @@ GitHub Actions, 04:30, 10:30, 16:30 and 22:30 UTC, a backup slot 71 min after ea
 | `parts.since.lightning` | EUMETSAT MTG Lightning Imager: per day and 0.5° cell the hours whose sampled frame (one 5-minute frame per hour) showed lightning, Europe/North Atlantic and the Middle East |
 | `parts.since.mrms` | NOAA MRMS: per day and 0.5° cell the hours with radar reflectivity ≥ 40 dBZ, and the day's radar-estimated hail, US |
 | `parts.since.nat` | the North Atlantic tracks of every day of its window, both directions, with entry and exit points |
-| `parts.since.gfs` | GFS 00Z analyses of every day of its window: jet at 250 hPa (FL340), tropopause, max-wind and freezing level, three map frames |
+| `parts.since.gfs` | GFS 00Z analyses of every day of its window: jet at 300, 250 and 200 hPa (FL300/340/390), tropopause, max-wind and freezing level, three map frames |
 | `parts.since.faa` | FAA Command Center weather restrictions per day and ARTCC; airports with weather programs as positions (no codes, no names) |
 | `parts.since.sigwx` | SIGWX of every day of its window at 12Z: the official WAFS chart and the model-derived picture from the GFS 12Z analysis |
 | `status.<part>` | `{ ok, error?, seconds, requests, megabytes, hosts }`; the since sub-parts as `status["since.lightning"]` etc., with `cache { reused, fetched }` |
@@ -94,9 +94,10 @@ A reader that knows only the parts above ignores these four; the schema name sta
   coords, entry, exit, lat30 }`, `coords` = `"lat,lon lat,lon …"` (south and west negative), `entry` / `exit`
   = the named points before the first and after the last coordinate. `missingDays[]`: `{ date, missing:
   ['eastbound' | 'westbound'] }`.
-- **`since.gfs`** `{ model, jetLevels: ['250'], jet, levels, archiveDays, notes }`. `jet` and `levels` have the
-  shape of the weekly review's GFS layers: `jet { res, lat0, lon0, nlat, nlon, encoding: 'base64-uint8',
-  levels: ['250'], byLevel: {}, days [{ date, valid, kt }], max [{ date, kt, lat, lon }], missing, areas { na,
+- **`since.gfs`** `{ model, jetLevels: ['300', '250', '200'], jet, levels, archiveDays, notes }` (three levels since
+  2026-10-13; before: 250 hPa only). `jet` and `levels` have the shape of the weekly review's GFS layers: `jet { res, lat0,
+  lon0, nlat, nlon, encoding: 'base64-uint8', levels: ['300', '250', '200'], byLevel { 300, 200 } (each { days, max } on
+  the same grid), days [{ date, valid, kt }], max [{ date, kt, lat, lon }], missing, areas { na,
   me } }`, knots at grid point `lat0 + j·res`, `lon0 + i·res` = byte `j·nlon + i` of `kt`; `levels { …same
   grid, days [{ date, valid, trop, maxw, frz }], ranges, label, method, areas { na, me } }`, flight level =
   byte × 5, 0 = missing, `frz` 1 = at or near the surface. Top level = Europe/North Atlantic (25–75N, 80W–40E),
@@ -120,6 +121,18 @@ A reader that knows only the parts above ignores these four; the schema name sta
   cycle +6 h; CAT with the fixed thresholds). The 12Z analysis is out at about 17Z, so today joins on a late
   run; until then it is in `missing` and `notes` ("not yet published"). For today a reader can use the 12Z chart
   of `parts.sigwx.ahead` and the forecast day of `parts.sigwxModel`.
+
+### ECMWF ENS probabilities at neutral points: `parts.wxoutlook.ecmwf.ens.points` (added 2026-10-13)
+
+`{ rule, grid { la1, lo1, di, dj, ni, nj, scan }, n, idx, encoding: 'base64-uint8', missing: 255, days [{ date,
+gust15Pct, gust25Pct, tp20Pct }] }`: the ECMWF ENS probabilities (10 m gust >= 15 / 25 m/s, precipitation >= 20 mm in the
+24 h from 00 UTC, percent of the 51 members) at the 0.25° grid points next to every airport that OurAirports types as
+"large_airport" with scheduled service and a 4-letter ICAO code in Europe, North America and the Middle East (the
+nearest grid point of its position and of the positions 0.05° north, south, east and west). `idx` = the grid indices
+`j·ni + i`, ascending, as "first,delta,delta,…"; each day's field is one byte per index in that order, 255 = missing.
+No airport code, name or position is in the file. To read a place: its nearest grid point as in the GRIB grid
+(`j = round((lat − la1) / (dj · (scan & 0x40 ? 1 : −1)))`, `i = round(((lon − lo1) mod 360) / di)`), then the byte at
+that index's position in `idx`.
 
 ## Sources and licences
 

@@ -1195,7 +1195,10 @@ function parseSwpcScales(json) {
 // for — gfs.hubs, ecmwf.hubProb, spc.days[].hubs / spc.d48.days[].hubs. An empty list also skips the
 // ECMWF ENS probability fields (they exist only to be sampled at the hubs; about 20 fewer requests) and
 // leaves ecmwf.ens null. Absent = HUBS, unchanged.
-async function fetchWxOutlook({ backfill, hubs }) {
+// ensPoints (the relay, 2026-10-13, ADR-001 Q3): with hubs [] the ENS fields are read after all and published at neutral
+// grid points instead of hubs: ecmwf.ens.points { grid, idx, encoding, missing, days [{ date, gust15Pct, gust25Pct, tp20Pct }] }
+// (scripts/ens-points.js; [[lat, lon], …] of the neutral airports). The page reads its hubs' values there. Absent = unchanged.
+async function fetchWxOutlook({ backfill, hubs, ensPoints }) {
   if (backfill) throw new Error('--backfill refused: a forecast issued in the past cannot be re-fetched honestly, and today\'s forecasts must not be filed under a past week');
   const t0 = Date.now(), nowIso = new Date().toISOString(), today = U.today();
   const outlook = { from: today, to: U.addDays(today, 6) };
@@ -1364,7 +1367,9 @@ async function fetchWxOutlook({ backfill, hubs }) {
       if (missing.length) notes.push('ECMWF jet: steps missing — ' + missing.join(', '));
       return { issued: cycle.iso, cycleObj: cycle, nat: aggregateDays(steps, outlook, []).nat, stepsRead: steps.map(s => s.step), stepsMissing: missing };
     });
-    if (Array.isArray(hubs) && !hubs.length) notes.push('ECMWF ENS hub probabilities not fetched: no hub list in this mode.');
+    const EP = ensPoints && ensPoints.length ? require('./ens-points.js') : null;
+    let ptIdx = null, ptGrid = null; const ptDays = {};
+    if (Array.isArray(hubs) && !hubs.length && !EP) notes.push('ECMWF ENS hub probabilities not fetched: no hub list in this mode.');
     else ec.ens = await run('ecmwf-ens', 'ECMWF ENS probabilities (open data)', ECMWF, async () => {
       const tried = []; let cycle = null, entries = null;
       for (const c of (ec.jet ? [ec.jet.cycleObj] : []).concat(cands.filter(x => !ec.jet || x.iso !== ec.jet.cycleObj.iso))) {
@@ -1378,13 +1383,25 @@ async function fetchWxOutlook({ backfill, hubs }) {
         try {
           const e = pickIndex(entries, { param: j.param, step: j.w.range });
           if (!e) throw new Error('not in the index');
-          const probs = hubProbs(decodeGrib2(await ecRange(ecmwfUrl(cycle, 'ep', 'grib2'), e))[0], hubs);   // only a field that arrived creates its day
-          (byDate[j.w.date] || (byDate[j.w.date] = {}))[j.key] = probs;
+          const fld = decodeGrib2(await ecRange(ecmwfUrl(cycle, 'ep', 'grib2'), e))[0];
+          if (EP) {   // neutral points: the first field fixes the grid; a field on another grid is left out
+            const gm = { la1: fld.la1, lo1: fld.lo1, di: fld.di, dj: fld.dj, ni: fld.ni, nj: fld.nj, scan: fld.scan };
+            if (!ptIdx) { ptGrid = gm; ptIdx = EP.gridPoints(fld, ensPoints, nearestIndex); }
+            if (JSON.stringify(gm) !== JSON.stringify(ptGrid)) throw new Error('another grid');
+            (ptDays[j.w.date] || (ptDays[j.w.date] = { date: j.w.date }))[j.key] = EP.sampleB64(fld, ptIdx);
+            (byDate[j.w.date] || (byDate[j.w.date] = {}))[j.key] = {};
+          } else {
+            const probs = hubProbs(fld, hubs);   // only a field that arrived creates its day
+            (byDate[j.w.date] || (byDate[j.w.date] = {}))[j.key] = probs;
+          }
         } catch (e) { missing.push(j.w.date + ' ' + j.param + ' (' + shortErr(e) + ')'); }
       });
       if (!Object.keys(byDate).length) throw new Error('no probability field read: ' + missing.join(', '));
       if (missing.length) notes.push('ECMWF ENS: fields missing — ' + missing.join(', '));
-      return { issued: cycle.iso, cycle: cycle.iso, windows: plan.ens, hubProb: hubProbTable(byDate, plan.ens.map(w => w.date), hubs), missing };
+      const points = EP && ptIdx ? { rule: 'OurAirports large airports with scheduled service, Europe, North America, Middle East (neutral; no hub list)',
+        grid: ptGrid, n: ptIdx.length, idx: EP.encodeIdx(ptIdx), encoding: 'base64-uint8', missing: EP.MISSING,
+        days: plan.ens.map(w => ptDays[w.date]).filter(Boolean) } : null;
+      return { issued: cycle.iso, cycle: cycle.iso, windows: plan.ens, hubProb: EP ? [] : hubProbTable(byDate, plan.ens.map(w => w.date), hubs), points, missing };
     });
     ec.conv = await run('ecmwf-conv', 'ECMWF IFS HRES MUCAPE + precipitation rate (open data)', ECMWF, async () => {
       const { cycle, plan } = await pickCycle(p => (p.conv.length ? p.conv[p.conv.length - 1].step : null), ec.jet && ec.jet.cycleObj);
@@ -1406,7 +1423,7 @@ async function fetchWxOutlook({ backfill, hubs }) {
       convectiveHourUtc: ECMWF_CONV_HOUR, convectiveFields: 'MUCAPE and total precipitation rate (instantaneous)', convective: ec.conv ? ec.conv.convective : null,
       convGrid: ec.conv ? ec.conv.convGrid : null,
       hubProb: ec.ens ? ec.ens.hubProb : [],
-      ens: ec.ens ? { cycle: ec.ens.cycle, issued: ec.ens.issued, windows: ec.ens.windows, listedFromPct: ENS_LIST_PCT,
+      ens: ec.ens ? { cycle: ec.ens.cycle, issued: ec.ens.issued, windows: ec.ens.windows, listedFromPct: ENS_LIST_PCT, points: ec.ens.points || null,
                       fields: { gust15Pct: 'P(10 m gust >= 15 m/s = 29 kt) in the 24 h from 00 UTC', gust25Pct: 'P(10 m gust >= 25 m/s = 49 kt)', tp20Pct: 'P(precipitation >= 20 mm in 24 h)' } } : null,
       stepsRead: { jet: ec.jet ? ec.jet.stepsRead : [], convective: ec.conv ? ec.conv.stepsRead : [] },
       stepsMissing: { jet: ec.jet ? ec.jet.stepsMissing : [], convective: ec.conv ? ec.conv.stepsMissing : [], ens: ec.ens ? ec.ens.missing : [] },

@@ -1352,15 +1352,16 @@ async function fetchUsObserved({ from, to, nowMs: nowArg, gapMs }) {
 // ---- GFS analyses of the days so far (the public relay's "This week", 2026-10-12) --------------------------------
 // The jet at 250 hPa (≈ FL340) and the flight-level grids (tropopause, max-wind level, freezing level) of the 00Z
 // analysis of each day of the window, in all three map frames: the `jet` and `levels` objects of fetchWxReview, built
-// by the same reducers, so the Last-week renderers draw them unchanged (jet.levels = ['250'], byLevel empty: FL300 and
-// FL390 are not requested, to keep the public file small). One request per day as in the weekly run (NOMADS; the
+// by the same reducers, so the Last-week renderers draw them unchanged. Since 2026-10-13 (PO decision: one source per
+// layer in every view) the same three jet levels as the weekly run, 300/250/200 hPa (FL300/340/390; before: 250 only,
+// to keep the public file small; about +85 KB on a Sunday). One request per day as in the weekly run (NOMADS; the
 // archive on AWS when NOMADS does not answer). Nothing international or airport-specific is read.
 // Incremental: cache.prev { kind: 'gfs', version, params, days: { 'YYYY-MM-DD': { valid, grids, levels, areas } } }
 // holds the reduced grids of the days already read (an analysis does not change), so only new days are requested;
 // days outside the window are dropped. A cache of another version or with other grids or levels (params) is dropped.
 //   fetchGfsObserved({ from, to, cache, nowMs, gapMs, softDeadlineS })   nowMs, gapMs: tests only
-const GFS_RELAY_LEVELS = ['250'];
-const GFS_CACHE_VERSION = 1;
+const GFS_RELAY_LEVELS = WX.JET_LEVELS.slice();
+const GFS_CACHE_VERSION = 2;
 const gfsCacheParams = () => JSON.stringify({ jet: WX.JET_GRID, areas: WX.AREA_JET_GRID, levels: GFS_RELAY_LEVELS, lev: WX.LEVEL_LEVS });
 function readGfsCache(c) {
   const fresh = why => ({ days: {}, dropped: why });
@@ -1390,15 +1391,14 @@ async function fetchGfsObserved({ from, to, cache, nowMs: nowArg, gapMs, softDea
     catch (e) { const b = /HTTP (403|429)\b/.exec(String((e && e.message) || e)); if (b) dead.set(h, h + ' answered ' + b[0] + ' — not asked again'); throw e; }
   }
   const prev = cache ? readGfsCache(cache.prev) : { days: {}, dropped: null }, got = {};
-  const only250 = g => ({ '250': g['250'] });
   let reused = 0;
   for (const d of daysOf(from, to)) {
     if (prev.days[d]) { got[d] = prev.days[d]; reused++; continue; }
     if (Date.parse(d + 'T04:00:00Z') > nowMs) { missing.push(d + ' (not yet published)'); continue; }
     try {
       const r = await readGfsDay(d, GFS_RELAY_LEVELS, req), A = r.item.areas, areas = {};
-      Object.keys(A).forEach(a => { areas[a] = { grids: only250(A[a].grids), levels: A[a].levels }; });
-      got[d] = { valid: r.item.valid, grids: only250(r.item.grids), levels: r.levels, areas };
+      Object.keys(A).forEach(a => { areas[a] = { grids: A[a].grids, levels: A[a].levels }; });
+      got[d] = { valid: r.item.valid, grids: r.item.grids, levels: r.levels, areas };
       if (r.archived) archived.push(d);
     } catch (e) { missing.push(d + ' (' + clip(String(e.message || e).replace(/^https?:\/\/\S+: /, ''), 60) + ')'); }
   }
