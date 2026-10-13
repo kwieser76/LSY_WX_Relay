@@ -38,6 +38,24 @@ jobs:
         with:
           ref: main
 
+      # GitHub disables the schedule of a public repo after 60 days without a commit, and the force-push to "data" is not
+      # reliably counted as activity (review 2026-10-13): once a month a scheduled run commits KEEPALIVE to main.
+      - name: Keep the schedule alive (a commit to main when the last one is older than 30 days)
+        if: github.event_name == 'schedule'
+        run: |
+          set -euo pipefail
+          last="$(git log -1 --format=%ct)"
+          if [ $(( $(date +%s) - last )) -gt $(( 30 * 86400 )) ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            printf 'Last keep-alive commit: %s. GitHub disables the schedule after 60 days without a commit.\n' "$(date -u +%Y-%m-%d)" > KEEPALIVE
+            git add KEEPALIVE
+            git commit -q -m "Keep-alive $(date -u +%Y-%m-%d)"
+            git push -q origin HEAD:main || echo "::warning title=WX relay::keep-alive commit not pushed (main moved?) - the next scheduled run tries again"
+          else
+            echo "Last commit on main $(( ($(date +%s) - last) / 86400 )) day(s) ago - no keep-alive needed."
+          fi
+
       - name: Set up Node 20
         uses: actions/setup-node@v4
         with:
