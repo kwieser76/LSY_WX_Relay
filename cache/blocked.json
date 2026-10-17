@@ -1,0 +1,13 @@
+{
+ "_comment": "Stop note of the relay: a host that answered HTTP 403/429 is not contacted until \"until\". Delete an entry (or the file) on the data branch to ask again earlier.",
+ "blocked": [
+  {
+   "host": "nms.aim.faa.gov",
+   "status": 403,
+   "at": "2026-10-17T04:37:03.114Z",
+   "until": "2026-10-18T04:37:03.114Z",
+   "path": "/datanat/nat.json",
+   "part": "nat"
+  }
+ ]
+}
