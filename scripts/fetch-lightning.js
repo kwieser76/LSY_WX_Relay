@@ -61,6 +61,7 @@
 
 const crypto = require('crypto');
 const U = require('./fetch-util.js');
+const L = require('./wx-layers.js');        // the weather layer registry: producer stamp (ADR-001)
 const PNG = require('./png-lite.js');
 
 const WMS = 'https://view.eumetsat.int/geoserver/wms';
@@ -467,6 +468,7 @@ async function fetchLightning({ from, to, pauseMs, nowMs: nowArg, cache, maxFram
   out.summary = [from + ' .. ' + to + ' · ' + read.length + '/' + frames.length + ' frames · ' + agg.litCells + ' cells with lightning · max ' + agg.max + ' h/day, ' + agg.weekMax + ' h/week' +
                  (top ? ' · most over ' + top.area + ' (peak ' + top.peakDate + ')' : '') + ' · Middle East ' + aggMe.litCells + ' cells' +
                  (aggMe.hotspots[0] ? ', most over ' + aggMe.hotspots[0].area : '') + ' · ' + (hits[HOST] || 0) + ' requests (median ' + (out.timing ? out.timing.medianMs : '?') + ' ms) · ' + out.seconds + ' s'];
+  out.producer = L.stamp('lightning', JSON.parse(cacheParams()));
   return out;
 }
 

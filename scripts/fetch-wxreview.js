@@ -85,7 +85,8 @@ const fs = require('fs');
 const path = require('path');
 const U = require('./fetch-util.js');
 
-const WX = require('./fetch-wxoutlook.js');      // GRIB2 decoder, binary GET, jet-grid reducer (shared with the outlook)
+const WX = require('./fetch-wxoutlook.js');
+const L = require('./wx-layers.js');        // the weather layer registry: parameters both callers use, producer stamps      // GRIB2 decoder, binary GET, jet-grid reducer (shared with the outlook)
 
 const AWC_URL = stamp => 'https://aviationweather.gov/api/data/isigmet?format=json&date=' + stamp;
 const NOMADS = 'https://nomads.ncep.noaa.gov/cgi-bin/filter_gfs_1p00.pl';
@@ -180,7 +181,7 @@ const PAGES = {
 };
 
 const AWC_DAYS_KEPT = 30;          // "up to the previous 30 days" (aviationweather.gov/data/api)
-const SAMPLE_STEP_H = 3;
+const SAMPLE_STEP_H = L.profile('us-convective').sampleStepH;   // 3 h; the AWC samples use the same moments
 const GAP_MS = { 'aviationweather.gov': 1100, 'mesonet.agron.iastate.edu': 1200, 'www.spc.noaa.gov': 300, 'nomads.ncep.noaa.gov': 1100 };   // start to start
 // Time budget. Normal run: about 100 s, all of it the AWC calls (56 SIGMET samples, then 7 PIREP
 // days; the other sources run beside them). Past the soft deadline no new request starts, and a
@@ -612,7 +613,7 @@ function parseIemKml(text) {
 // The US convective SIGMETs of the rows as AWC-like records with their validity, for the North America grid.
 // Reissued every hour at H+55 for 2 h, so at a sample moment (H+00) only the newest issue (less than 60 min old,
 // i.e. the H−0:05 batch) is taken — the batch of H−1:05, still formally valid, is its predecessor, not another storm.
-const CONV_FRESH_MS = 60 * 60000;
+const CONV_FRESH_MS = L.profile('us-convective').convFreshMin * 60000;
 function iemConvective(rows) {
   return (rows || []).filter(r => /CONVECTIVE SIGMET/.test(r.TEXT) && !/CONVECTIVE SIGMET\s*\.*\s*NONE/.test(r.TEXT) && !isCancel(r.TEXT) && (r.rings || []).length)
     .map(r => ({ issue: Date.parse(r.ISSUE), expire: Date.parse(r.EXPIRE),
@@ -1043,10 +1044,56 @@ function summarizeSpc(days) {
 // read: the AWC samples; conv: iemConvective() of the IEM KML (null when that source failed); naPireps: naPirepBlock().
 const NA_SOURCES = ['AWC international SIGMETs, 3-hourly samples (Mexico, Central America, Caribbean, US oceanic, Alaska)',
                     'IEM SIGMET archive: US convective SIGMETs in force at the same moments (newest hourly issue only); US oceanic SIGMETs from AWC only'];
+// ---- US convective SIGMETs, the North America grid and SPC storm reports: one code path (ADR-001 S3, 2026-10-20) ----
+// The Monday run (fetchWxReview) and the relay (fetchUsObserved) read these the same way; they differ only in the
+// window, in whether the US oceanic SIGMETs are kept (Monday) and in the AWC international SIGMETs that the Monday run
+// adds to the North America grid (private, C2). text(url, ms) is the caller's paced, counted getter.
+// The producer stamps of these layers (scripts/wx-layers.js): the same in the Monday snapshot and the relay part.
+const usStamp = () => L.stamp('us-convective', { grid: AREA_SIGMET_GRID.na, box: WX.MAP_AREAS.na });
+const spcStamp = () => L.stamp('spc-reports', null);
+// The IEM archive, one request: { us: aggregateIemSigmets, conv: iemConvective } of the window.
+async function readIemUs(text, window, opts) {
+  const o = opts || {};
+  const body = await text(iemSigmetUrl(window.from, window.to), TIMEOUT_MS.iem);
+  if (!/<kml\b/.test(body.slice(0, 400))) throw new Error('no KML in the answer: ' + clip(body.slice(0, 120), 100));
+  const rows = parseIemKml(body), us = aggregateIemSigmets(rows, window);
+  // A whole week without one SIGMET is a broken answer; a window of a day or two can be quiet.
+  if (o.requireAny && !us.convective.total && !us.oceanic.length) throw new Error('no SIGMET in ' + rows.length + ' rows — the archive answered empty for a whole week');
+  if (!o.keepOceanic) { us.oceanic = []; us.pacificOceanic = 0; }
+  us.producer = usStamp();
+  return { us, conv: iemConvective(rows) };
+}
+// The SPC storm reports, one file per started day (a day file covers 12Z that day to 12Z the next).
+async function readSpcDays(text, window, nowMs, notes) {
+  const days = [], missing = [], points = [];
+  for (const d of daysOf(window.from, window.to)) {
+    if (Date.parse(d + 'T12:00:00Z') > nowMs) { missing.push(d + ' (not started)'); continue; }
+    try { const t = await text(SPC_CSV(d), TIMEOUT_MS.spc); days.push(Object.assign({ date: d, page: SPC_DAY_PAGE(d) }, parseSpcCsv(t))); points.push(...spcPoints(t, d)); }
+    catch (e) { missing.push(d + ' (' + clip(String(e.message || e).replace(/^https?:\/\/\S+: /, ''), 60) + ')'); }
+  }
+  if (!days.length) throw new Error('no day file read: ' + missing.join(', '));
+  if (missing.some(m => !/not started/.test(m))) notes.push('SPC: day files not read — ' + missing.join(', '));
+  const last = days[days.length - 1].date;
+  if (nowMs < Date.parse(U.addDays(last, 1) + 'T12:00:00Z')) notes.push('SPC: the ' + last + ' file covers 12Z ' + last + ' to 12Z next day and is still incomplete at run time');
+  days.forEach(d => { d.topStates = Object.entries(d.states).sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).slice(0, 3).map(([st, n]) => st + ' ' + n); delete d.states; });
+  points.sort((a, b) => a[0].localeCompare(b[0]) || a[1] - b[1]);
+  return { dayDefinition: '12Z on the date to 11:59Z the next day, preliminary reports', days, missing, week: summarizeSpc(days),
+           reportFields: ['t', 'lat', 'lon', 'kind', 'magnitude'], reportCodes: { T: 'tornado (EF rating, null = unrated)', W: 'wind (mph, null = unknown)', H: 'hail (inches)' },
+           reports: points, producer: spcStamp() };
+}
+// The North America SIGMET grid at the sample moments [{ time, list }]: the US convective SIGMETs in force at each
+// moment, plus the AWC international SIGMETs in `list` (the Monday run's samples read; [] in the relay). withAwc: the
+// moments carry AWC samples (only the source lines depend on it). conv: iemConvective() or null when IEM failed.
+function naConvectiveGrid(moments, conv, window, withAwc) {
+  const hasConv = !!(conv && conv.length);
+  const g = areaSigmet(hasConv ? withConvective(moments, conv) : moments, window, 'na', withAwc ? (hasConv ? NA_SOURCES : NA_SOURCES.slice(0, 1)) : NA_SOURCES.slice(1));
+  g.producer = usStamp();          // the US part; on Monday `sources` names the AWC SIGMETs added to it
+  return g;
+}
 function addAreaLayers(out, read, conv, naPireps, window, notes) {
   if (read && read.length && out.sigmetGrid) {
     out.sigmetGrid.areas = {
-      na: areaSigmet(conv && conv.length ? withConvective(read, conv) : read, window, 'na', conv && conv.length ? NA_SOURCES : NA_SOURCES.slice(0, 1)),
+      na: naConvectiveGrid(read, conv, window, true),
       me: areaSigmet(read, window, 'me', ['AWC international SIGMETs, 3-hourly samples']),
     };
     (out.sigmetGrid.days || []).forEach(d => Object.keys(out.sigmetGrid.areas).forEach(a => {
@@ -1071,8 +1118,9 @@ function addAreaLayers(out, read, conv, naPireps, window, notes) {
 }
 
 // ---- fetch ------------------------------------------------------------------------------------
-async function fetchWxReview({ from, to }) {
-  const t0 = Date.now(), nowMs = Date.now();
+//   fetchWxReview({ from, to })   nowMs, gapMs: tests only (the golden tests, scripts/golden/)
+async function fetchWxReview({ from, to, nowMs: nowArg, gapMs }) {
+  const t0 = Date.now(), nowMs = nowArg == null ? Date.now() : nowArg;
   const oldestMs = nowMs - AWC_DAYS_KEPT * 86400000 + 3600000;
   if (Date.parse(from + 'T00:00:00Z') < oldestMs) {
     throw new Error('the AWC SIGMET database keeps ' + AWC_DAYS_KEPT + ' days; ' + from + ' is older than ' +
@@ -1087,7 +1135,7 @@ async function fetchWxReview({ from, to }) {
     const h = url.split('/')[2];
     if (dead.has(h)) throw new Error('skipped — ' + dead.get(h));
     if (late()) throw new Error('skipped — time budget (' + SOFT_DEADLINE_S + ' s) used up');
-    const wait = (lastStart[h] || 0) + (GAP_MS[h] || 500) - Date.now();
+    const wait = (lastStart[h] || 0) + (gapMs != null ? gapMs : (GAP_MS[h] || 500)) - Date.now();
     if (wait > 0) await U.sleep(wait);
     lastStart[h] = Date.now();
     hits[h] = (hits[h] || 0) + 1;
@@ -1133,7 +1181,7 @@ async function fetchWxReview({ from, to }) {
       awcRead = read;
       const gaps = feedGaps(read);
       if (gaps.length) notes.push(gapNote(gaps));
-      return Object.assign({ samples: src.samples }, aggregateSigmets(read, window));
+      return Object.assign({ samples: src.samples }, aggregateSigmets(read, window), { producer: L.stamp('sigmets-international', null) });
     });
     // Pilot / aircraft reports after the SIGMET samples, on the same host and pacing.
     out.pireps = await run('awc-pirep', 'AWC pilot/aircraft reports, moderate or worse (one call per day)', PIREP_URL, PAGES.pirep, async src => {
@@ -1182,19 +1230,16 @@ async function fetchWxReview({ from, to }) {
       const r = aggregateMetars(rows, window);
       if (r.missing.length === HUBS.length) throw new Error('none of the ' + HUBS.length + ' hubs in the answer');
       r.source = { archiveDays: fromArchive, iemDays: fromIem };
+      r.producer = L.stamp('hub-weather', { thresholds: HUB_T });
       if (fromIem.length && fromArchive.length) notes.push('Hub METARs: ' + fromArchive.length + ' day(s) from the public METAR/TAF archive, ' + fromIem.length + ' from IEM (' + fromIem.join(', ') + ')');
       if (archiveErr.length) notes.push('Hub METARs: archive day file(s) not read — ' + archiveErr.join(', '));
       if (r.missing.length) notes.push('Hub METARs: no observations for ' + r.missing.join(', '));
       return r;
     });
     out.us = await run('iem-sigmet', 'IEM SIGMET archive (US convective + oceanic)', IEM_SIGMET, PAGES.iemSigmet, async () => {
-      const body = await text(iemSigmetUrl(from, to), TIMEOUT_MS.iem);
-      if (!/<kml\b/.test(body.slice(0, 400))) throw new Error('no KML in the answer: ' + clip(body.slice(0, 120), 100));
-      const rows = parseIemKml(body);
-      const r = aggregateIemSigmets(rows, window);
-      if (!r.convective.total && !r.oceanic.length) throw new Error('no SIGMET in ' + rows.length + ' rows — the archive answered empty for a whole week');
-      convRecs = iemConvective(rows);
-      return r;
+      const r = await readIemUs(text, window, { keepOceanic: true, requireAny: true });
+      convRecs = r.conv;
+      return r.us;
     });
     // North American pilot reports: the IEM archive, one request for the week (AWC would need 28 calls: over 400 a day).
     naPireps = await run('iem-pirep', 'IEM PIREP archive (North America, one request)', IEM_PIREP, PAGES.iemPirep, async () => {
@@ -1204,22 +1249,7 @@ async function fetchWxReview({ from, to }) {
       if (!r.read) throw new Error('no PIREP row in the answer');
       return naPirepBlock(r.rows, window, { calls: 1, read: r.read, duplicates: r.duplicates });
     });
-    out.spc = await run('spc-reports', 'SPC storm reports (7 daily files)', 'https://www.spc.noaa.gov/climo/reports/', PAGES.spc, async () => {
-      const days = [], missing = [], points = [];
-      for (const d of daysOf(from, to)) {
-        if (Date.parse(d + 'T12:00:00Z') > nowMs) { missing.push(d + ' (not started)'); continue; }
-        try { const t = await text(SPC_CSV(d), TIMEOUT_MS.spc); days.push(Object.assign({ date: d, page: SPC_DAY_PAGE(d) }, parseSpcCsv(t))); points.push(...spcPoints(t, d)); }
-        catch (e) { missing.push(d + ' (' + clip(String(e.message || e).replace(/^https?:\/\/\S+: /, ''), 60) + ')'); }
-      }
-      if (!days.length) throw new Error('no day file read: ' + missing.join(', '));
-      if (missing.length) notes.push('SPC: day files not read — ' + missing.join(', '));
-      if (nowMs < Date.parse(U.addDays(to, 1) + 'T12:00:00Z')) notes.push('SPC: the ' + to + ' file covers 12Z ' + to + ' to 12Z next day and is still incomplete at run time');
-      days.forEach(d => { d.topStates = Object.entries(d.states).sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).slice(0, 3).map(([s, n]) => s + ' ' + n); delete d.states; });
-      points.sort((a, b) => a[0].localeCompare(b[0]) || a[1] - b[1]);
-      return { dayDefinition: '12Z on the date to 11:59Z the next day, preliminary reports', days, missing, week: summarizeSpc(days),
-               reportFields: ['t', 'lat', 'lon', 'kind', 'magnitude'], reportCodes: { T: 'tornado (EF rating, null = unrated)', W: 'wind (mph, null = unknown)', H: 'hail (inches)' },
-               reports: points };
-    });
+    out.spc = await run('spc-reports', 'SPC storm reports (7 daily files)', 'https://www.spc.noaa.gov/climo/reports/', PAGES.spc, () => readSpcDays(text, window, nowMs, notes));
   }
 
   // GFS analyses, 00Z of each day of the window: the jet map at 300/250/200 hPa and, from the same
@@ -1230,7 +1260,7 @@ async function fetchWxReview({ from, to }) {
       for (const d of daysOf(from, to)) {
         if (Date.parse(d + 'T04:00:00Z') > nowMs) { missing.push(d + ' (not yet published)'); continue; }
         try {
-          const r = await readGfsDay(d, WX.JET_LEVELS, req);
+          const r = await readGfsDay(d, GFS_LEVELS, req);
           if (r.archived) archived.push(d);
           items.push(r.item);
           if (r.levels) levelItems.push({ valid: r.item.valid, grids: r.levels, areas: r.item.areas }); else noLevels.push(d);
@@ -1250,6 +1280,8 @@ async function fetchWxReview({ from, to }) {
       const jet = WX.jetLevels(items, 'GFS analysis', { hourUtc: 0, missing });
       const aj = jet && WX.areaJetLevels(items, 'GFS analysis', { hourUtc: 0 });
       if (aj) jet.areas = aj;
+      if (jet) jet.producer = gfsStamp('gfs-jet');
+      if (out.levels) out.levels.producer = gfsStamp('gfs-levels');
       return jet;
     });
   }
@@ -1308,36 +1340,18 @@ async function fetchUsObserved({ from, to, nowMs: nowArg, gapMs }) {
                 hubs: null, sigmets: null, pireps: null, jet: null, levels: null };
   let conv = null;
   out.us = await run('iem-sigmet', 'IEM SIGMET archive (US convective SIGMETs)', IEM_SIGMET, PAGES.iemSigmet, async () => {
-    const body = await text(iemSigmetUrl(from, to), TIMEOUT_MS.iem);
-    if (!/<kml\b/.test(body.slice(0, 400))) throw new Error('no KML in the answer: ' + clip(body.slice(0, 120), 100));
-    const rows = parseIemKml(body), r = aggregateIemSigmets(rows, window);
-    conv = iemConvective(rows);
-    r.oceanic = []; r.pacificOceanic = 0;
-    return r;
+    const r = await readIemUs(text, window, { keepOceanic: false });
+    conv = r.conv;
+    return r.us;
   });
-  out.spc = await run('spc-reports', 'SPC storm reports (one file per day)', 'https://www.spc.noaa.gov/climo/reports/', PAGES.spc, async () => {
-    const days = [], missing = [], points = [];
-    for (const d of daysOf(from, to)) {
-      if (Date.parse(d + 'T12:00:00Z') > nowMs) { missing.push(d + ' (not started)'); continue; }
-      try { const t = await text(SPC_CSV(d), TIMEOUT_MS.spc); days.push(Object.assign({ date: d, page: SPC_DAY_PAGE(d) }, parseSpcCsv(t))); points.push(...spcPoints(t, d)); }
-      catch (e) { missing.push(d + ' (' + clip(String(e.message || e).replace(/^https?:\/\/\S+: /, ''), 60) + ')'); }
-    }
-    if (!days.length) throw new Error('no day file read: ' + missing.join(', '));
-    if (missing.some(m => !/not started/.test(m))) notes.push('SPC: day files not read — ' + missing.join(', '));
-    if (nowMs < Date.parse(U.addDays(to, 1) + 'T12:00:00Z')) notes.push('SPC: the ' + days[days.length - 1].date + ' file covers 12Z that day to 12Z the next and is still incomplete at run time');
-    days.forEach(d => { d.topStates = Object.entries(d.states).sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).slice(0, 3).map(([st, n]) => st + ' ' + n); delete d.states; });
-    points.sort((a, b) => a[0].localeCompare(b[0]) || a[1] - b[1]);
-    return { dayDefinition: '12Z on the date to 11:59Z the next day, preliminary reports', days, missing, week: summarizeSpc(days),
-             reportFields: ['t', 'lat', 'lon', 'kind', 'magnitude'], reportCodes: { T: 'tornado (EF rating, null = unrated)', W: 'wind (mph, null = unknown)', H: 'hail (inches)' },
-             reports: points };
-  });
+  out.spc = await run('spc-reports', 'SPC storm reports (one file per day)', 'https://www.spc.noaa.gov/climo/reports/', PAGES.spc, () => readSpcDays(text, window, nowMs, notes));
   if (!sources.some(x => x.ok)) throw new Error('every source failed: ' + notes.slice(0, 2).join('; '));
   // The North America SIGMET grid at the 3-hourly sample moments the weekly file uses, from the IEM rows only.
   if (conv) {
     const moments = samplesFor(from, to, nowMs).planned.map(t => ({ time: t, list: [] }));
     out.sigmetGrid = sigmetGrid([]);
     out.sigmetGrid.days = sigmetDays([], window).map(d => ({ date: d.date, samples: 0, hazards: {}, counts: {} }));
-    out.sigmetGrid.areas = { na: areaSigmet(withConvective(moments, conv), window, 'na', NA_SOURCES.slice(1)) };
+    out.sigmetGrid.areas = { na: naConvectiveGrid(moments, conv, window, false) };
     out.sigmetGrid.days.forEach(d => { const x = out.sigmetGrid.areas.na.days.find(y => y.date === d.date); if (x) d.counts.na = x.counts.na; });
   } else out.sigmetGrid = null;
   notes.push(US_ONLY_NOTE);
@@ -1360,7 +1374,10 @@ async function fetchUsObserved({ from, to, nowMs: nowArg, gapMs }) {
 // holds the reduced grids of the days already read (an analysis does not change), so only new days are requested;
 // days outside the window are dropped. A cache of another version or with other grids or levels (params) is dropped.
 //   fetchGfsObserved({ from, to, cache, nowMs, gapMs, softDeadlineS })   nowMs, gapMs: tests only
-const GFS_RELAY_LEVELS = WX.JET_LEVELS.slice();
+// The jet levels of both callers, from the registry (ADR-001 Q1: FL300/340/390 everywhere); one stamp per layer.
+const GFS_LEVELS = L.profile('gfs-jet').levels;
+const GFS_RELAY_LEVELS = GFS_LEVELS.slice();
+const gfsStamp = id => L.stamp(id, { grid: WX.JET_GRID, areas: WX.AREA_JET_GRID, lev: WX.LEVEL_LEVS, box: GFS_BOX });
 const GFS_CACHE_VERSION = 2;
 const gfsCacheParams = () => JSON.stringify({ jet: WX.JET_GRID, areas: WX.AREA_JET_GRID, levels: GFS_RELAY_LEVELS, lev: WX.LEVEL_LEVS });
 function readGfsCache(c) {
@@ -1408,11 +1425,13 @@ async function fetchGfsObserved({ from, to, cache, nowMs: nowArg, gapMs, softDea
   const jet = WX.jetLevels(items, 'GFS analysis', { hourUtc: 0, missing });
   const aj = WX.areaJetLevels(items, 'GFS analysis', { hourUtc: 0 });
   if (aj) jet.areas = aj;
+  jet.producer = gfsStamp('gfs-jet');
   const levels = WX.levelDays(levelItems, 'GFS 1.0° analysis', { hourUtc: 0 });
   if (levels) {
     notes.push(WX.LEVEL_NOTE);
     const al = WX.areaLevelDays(levelItems, 'GFS 1.0° analysis', { hourUtc: 0 });
     if (al) levels.areas = al;
+    levels.producer = gfsStamp('gfs-levels');
   }
   if (archived.length) notes.push('GFS analyses of ' + archived.join(', ') + ' read from the NOAA GFS archive on AWS (NOMADS did not answer).');
   if (missing.length) notes.push('GFS analyses not read — ' + missing.join(', '));
@@ -1634,6 +1653,7 @@ module.exports = { NAT_FIRS, CENTRAL_FIRS, HUBS, HUB_T, REGION_NAMES, PAGES, SIG
                    aggregateIemSigmets, parseSpcCsv, summarizeSpc, dayRanges, digest,
                    AREA_FIRS, AREA_SIGMET_GRID, COUNT_HAZARDS, FIR_ALIAS, GFS_BOX, hazardOf, ringTouches, areasOf, areaCounts, areaSigmet, parseIemKml, iemConvective,
                    withConvective, iemPirepUrl, iemSev, iemPirepRows, naPirepBlock, NA_PIREP_BOXES, spcPoints, wxCodes, dustHaze, addAreaLayers,
+                   readIemUs, readSpcDays, naConvectiveGrid,
                    areaSigmetLine, naPirepLine, meHubLine, fetchWxReview, cli, fetchUsObserved, US_ONLY_NOTE,
                    readGfsDay, fetchGfsObserved, readGfsCache, gfsCacheParams, GFS_RELAY_LEVELS };
 // The command line: U.main, then the snapshot rewritten without indentation (see compactSnapshot in fetch-wxoutlook.js).

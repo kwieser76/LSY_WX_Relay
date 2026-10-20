@@ -32,6 +32,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const U = require('./fetch-util.js');
+const L = require('./wx-layers.js');        // the weather layer registry: producer stamp (ADR-001)
 const FAA = require('./fetch-faa.js');
 
 const PAUSE_MS = 300;
@@ -125,7 +126,7 @@ function buildDays(captures, from, to, fixes) {
 async function fetchNatArchive({ from, to }) {
   const t0 = Date.now(), notes = [];
   const s = settingsOf(U.readConfig());
-  if (!s) return { configured: false, notes: ['config.json has no natArchive.repo'], summary: ['not set up (config.json natArchive missing) — snapshot says configured:false'] };
+  if (!s) return { configured: false, notes: ['config.json has no natArchive.repo'], summary: ['not set up (config.json natArchive missing) — snapshot says configured:false'], producer: L.stamp('nat-days', null) };
   const headers = s.visibility === 'private'
     ? { Authorization: 'Bearer ' + readToken(s.tokenFile), Accept: 'application/vnd.github.raw+json', 'X-GitHub-Api-Version': '2022-11-28' }
     : {};
@@ -158,7 +159,7 @@ async function fetchNatArchive({ from, to }) {
   const seconds = Math.round((Date.now() - t0) / 1000);
   return Object.assign({ configured: true, coordsEncoding: 'tracks[].coords: "lat,lon" pairs separated by spaces, south/west negative', source: { repo: s.repo, branch: s.branch, visibility: s.visibility, page: 'https://github.com/' + s.repo,
                                                      faa: 'https://nms.aim.faa.gov/nat', capture: 'twice daily, 05:30Z and 17:00Z (GitHub Actions)' } },
-    r, { requests, seconds, notes,
+    r, { requests, seconds, notes, producer: L.stamp('nat-days', null),
          summary: [from + ' .. ' + to + ' · ' + r.days.length + '/7 days with tracks · ' + captures.length + ' capture file(s) · ' + requests + ' requests · ' + seconds + ' s'] });
 }
 

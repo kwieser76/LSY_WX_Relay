@@ -52,6 +52,7 @@
 
 const fs = require('fs');
 const U = require('./fetch-util.js');
+const L = require('./wx-layers.js');        // the weather layer registry: producer stamp (ADR-001)
 
 const NAME = 'fetch-sigwx', DIR = 'sigwx';
 const HOST = 'aviationweather.gov';
@@ -519,6 +520,8 @@ async function getLayer(url, timeoutMs) {
 // newest run's ahead charts are requested (about 16 instead of about 73 requests). Absent = unchanged.
 // pastOnly (the relay's This-week part, fetchSigwxObserved): the past days only, no week ahead; dates = the
 // past days to read instead of from..to (the days not in the relay's cache). Absent = unchanged.
+// One stamp for the Monday snapshot, the relay's ahead charts and This week's days (scripts/wx-layers.js).
+const sigwxStamp = () => L.stamp('sigwx-official', { types: TYPES, boxes: BOXES, base: BASE });
 async function fetchSigwx({ from, to, nowMs, gapMs, asOf, aheadOnly, pastOnly, dates }) {   // nowMs, gapMs: tests only
   const t0 = Date.now(), now = nowMs != null ? nowMs : (asOf ? Date.parse(asOf) : Date.now());
   const gap = gapMs != null ? gapMs : GAP_MS;
@@ -632,6 +635,7 @@ async function fetchSigwx({ from, to, nowMs, gapMs, asOf, aheadOnly, pastOnly, d
   if (dupes) out.duplicatesDropped = dupes;
   if (aheadOnly) out.aheadOnly = true;
   if (pastOnly) out.pastOnly = true;
+  out.producer = sigwxStamp();
   out.seconds = Math.round((Date.now() - t0) / 1000);
   out.snapshotBytes = Buffer.byteLength(JSON.stringify(out));
   const nf = d => d.features.length;
@@ -680,7 +684,7 @@ async function fetchSigwxObserved({ from, to, cache, nowMs, gapMs }) {   // nowM
   const seconds = Math.round((Date.now() - t0) / 1000);
   return { label: LABEL, attribution: ATTRIBUTION, disclaimer: DISCLAIMER, issuer: ISSUER, issuerNote: ISSUER_NOTE, pages: PAGES,
            choice: 'one chart per day valid 12Z, from the 06Z run +6 h (the shortest lead); stand-ins 00Z +12 h, previous 18Z +18 h, previous 12Z +24 h',
-           areas: AREA_IDS, boxes: BOXES, days, missing, requests: { [HOST]: fetched }, notes, seconds,
+           areas: AREA_IDS, boxes: BOXES, days, missing, requests: { [HOST]: fetched }, notes, seconds, producer: sigwxStamp(),
            summary: [from + ' .. ' + to + ' · ' + days.length + ' chart(s) (' + (all.length - need.length) + ' from the cache) · ' + fetched + ' requests · ' + seconds + ' s'] };
 }
 

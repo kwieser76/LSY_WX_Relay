@@ -35,6 +35,7 @@
 const fs = require('fs');
 const path = require('path');
 const U = require('./fetch-util.js');
+const L = require('./wx-layers.js');        // the weather layer registry: producer stamp of the restrictions layer
 
 const HOST = 'https://www.fly.faa.gov';
 const FORM = HOST + '/adv/advAdvisoryForm';
@@ -185,7 +186,8 @@ const ROUTINE = new Set(['WEATHER', 'VOLUME', 'RWY-TAXI']);
 
 // ---- fetch -------------------------------------------------------------------
 let REQUESTS = 0;
-async function get(url) { REQUESTS++; const t = await U.getText(url, { accept: 'text/html', timeoutMs: 30000, retries: 2 }); await U.sleep(PAUSE_MS); return t; }
+let pauseNow = PAUSE_MS;   // fetchFaa's pauseMs (tests only)
+async function get(url) { REQUESTS++; const t = await U.getText(url, { accept: 'text/html', timeoutMs: 30000, retries: 2 }); await U.sleep(pauseNow); return t; }
 
 // The names an earlier briefing would have used for an airport: empty in this relay copy.
 const ALIASES = {};
@@ -479,39 +481,79 @@ function aggregateArtcc(inp) {
   return { ids: ARTCC_IDS.slice(), oconus: ARTCC_OCONUS.slice(), names: ARTCC_NAMES, days, week, airports, canada: 'no public data', canadaNote: CANADA_NOTE, notes };
 }
 
-// The extra pages: reroute reasons, Gulf closures, airspace flow programs. Runs after everything else
-// and stops at `deadline` (ms): what is left counts as unverified, and a note says so.
-async function fetchArtccDetails(rows, deadline) {
-  const reasons = {}, closures = [], afps = [], notes = [], req = { reroute: 0, closure: 0, afp: 0, skipped: 0 };
-  const late = () => Date.now() > deadline;
+// ---- one advisory reader for the Monday run and the relay (ADR-001 S4, 2026-10-20) --------------------------------
+// fetchFaa (Monday) and fetchFaaObserved (relay) read the program, closure, reroute and airspace-flow pages through
+// readAdvisories and count weather programs with programCauses. They differ only in detail(): the Monday run reads
+// every page (programs and oceanic closures must be read, the rest within its time budget); the relay reads from its
+// cache first and stops at its soft deadline. Each page is reduced to what the ARTCC layer needs and holds no airport
+// code (the relay publishes its cache): programs { c: cause, p: period, a: index of the CTL ELEMENT among the list
+// element's tokens (absent = first, -1 = not among them) }, closures { f: [ARTCC], wx, n: 1 = a closure was read },
+// reroutes { r: 'WEATHER' | 'OTHER' | null }, airspace flow programs { c, p, z: ARTCC }.
+const causeWord = s => (/^[A-Z][A-Z-]{1,19}$/.test(String(s || '')) ? String(s) : 'OTHER');
+const elementTokens = el => (String(el || '').split('/')[0].match(/\b[A-Z0-9]{3,4}\b/g) || []);
+function reduceProgram(r, p) {
+  const i = p.airport ? elementTokens(r.element).indexOf(p.airport) : 0;
+  return Object.assign({ c: causeWord(p.category), p: parsePeriod(r.day, p.period) }, i > 0 ? { a: i } : {}, i < 0 ? { a: -1 } : {});
+}
+// The airport a program controls, one rule: the detail page's CTL ELEMENT when the caller kept it (ctl, Monday only:
+// the relay never holds a code it cannot cache), else the token the reduced page points to, else the list element.
+// The two differ only when the CTL ELEMENT is not in the list element (one airport's element controlling a neighbour).
+function programCode(r, x, ctl) {
+  if (ctl) return ctl;
+  const tk = elementTokens(r.element), first = String(r.element || '').split('/')[0].trim();
+  return x && x.a > 0 && tk[x.a] ? tk[x.a] : (x && x.a === -1 ? first : (tk[0] || first));
+}
+const reduceClosure = t => { const cx = parseClosure(t); return { f: cx.facilities.filter(z => /^(Z[A-Z]{2}|CZ[A-Z])$/.test(z)), wx: cx.wx, n: cx.reason ? 1 : 0 }; };
+const reasonWord = s => (s ? (/^WEATHER/.test(s) ? 'WEATHER' : 'OTHER') : null);
+// rows: the list rows of the window. detail(r, reduce, phase) -> the reduced page or null (not read); phase is
+// 'program' | 'oceanic' | 'reroute' | 'closure' | 'afp'. o.keepCodes: keep each program's CTL ELEMENT in memory (Monday);
+// o.onProgram(r, p, code): the full parse of a freshly read program page; o.onOceanic(r, text): an oceanic page's text.
+async function readAdvisories(rows, detail, o) {
+  o = o || {};
+  const advs = [], programs = [], closures = [], reasons = {}, afps = [], ctlOf = {};
+  for (const r of rows.filter(x => (x.kind === 'gs' || x.kind === 'gdp') && x.link)) {
+    const x = await detail(r, t => { const p = parseProgram(t);
+      if (o.keepCodes) ctlOf[r.day + '#' + r.n] = p.airport || null;
+      if (o.onProgram) o.onProgram(r, p, programCode(r, reduceProgram(r, p), o.keepCodes ? p.airport : null));
+      return reduceProgram(r, p); }, 'program');
+    if (!x) continue;
+    const code = programCode(r, x, ctlOf[r.day + '#' + r.n]);
+    advs.push({ kind: r.kind, code, day: r.day, t: sentTime(r.sent), period: x.p, category: x.c });
+    programs.push({ x, code, key: r.kind + '|' + code + '|' + r.day });
+  }
+  const addClosure = (r, x) => { const f = x.f.slice(); if (!f.length && centerOfElement(r.element)) f.push(centerOfElement(r.element)); closures.push({ day: r.day, facilities: f, wx: x.wx }); };
+  for (const r of rows.filter(x => x.kind === 'oceanic' && x.link)) {
+    const x = await detail(r, t => { if (o.onOceanic) o.onOceanic(r, t); return reduceClosure(t); }, 'oceanic');
+    if (x && x.n) addClosure(r, x);
+  }
+  // Reroutes / FCAs: the newest two versions of each, until one names its REASON; a page not read tries the next.
   for (const g of rerouteGroups(rows)) {
     if (!g.areas.some(a => ARTCC_IDS.indexOf(a) >= 0 || ARTCC_OCONUS.indexOf(a) >= 0)) continue;   // Canadian-only FCAs: no use
     for (const r of g.rows.filter(x => x.link).slice(0, 2)) {
-      if (late()) { req.skipped++; break; }
-      try { const x = parseReroute(adviceText(await get(r.link))); req.reroute++; if (x.reason) { reasons[g.key] = x.reason; break; } }
-      catch (e) { notes.push('reroute ' + g.name + ' of ' + g.day + ' unreadable: ' + e.message); }
+      const x = await detail(r, t => ({ r: reasonWord(parseReroute(t).reason) }), 'reroute');
+      if (x && x.r) { reasons[g.key] = x.r; break; }
     }
   }
   for (const g of closureGroups(rows)) {
-    for (const r of g.rows.slice(0, 2)) {
-      if (late()) { req.skipped++; break; }
-      try { const x = parseClosure(adviceText(await get(r.link))); req.closure++;
-        if (!x.facilities.length) { const c = centerOfElement(r.element); if (c) x.facilities.push(c); }
-        if (x.reason) { closures.push(Object.assign({ day: g.day }, x)); break; } }
-      catch (e) { notes.push('Gulf route closure of ' + g.day + ' unreadable: ' + e.message); }
-    }
+    for (const r of g.rows.slice(0, 2)) { const x = await detail(r, reduceClosure, 'closure'); if (x && x.n) { addClosure(r, x); break; } }
   }
   for (const r of rows.filter(x => x.kind === 'afp' && x.link && !/PROPOSED/.test(x.title))) {
-    if (late()) { req.skipped++; continue; }
-    try {
-      const t = adviceText(await get(r.link)), p = parseProgram(t); req.afp++;
-      const code = String(r.element || '').split('/')[0].trim() || p.airport;
-      const center = centerOfElement(r.element) || ((t.match(/\b(Z[A-Z]{2})\b/) || [])[1]) || null;
-      afps.push({ kind: 'afp', code, center, day: r.day, t: sentTime(r.sent), period: parsePeriod(r.day, p.period), category: p.category });
-    } catch (e) { notes.push('airspace flow program ' + r.n + ' of ' + r.day + ' unreadable: ' + e.message); }
+    const x = await detail(r, t => { const p = parseProgram(t);
+      return { c: causeWord(p.category), p: parsePeriod(r.day, p.period), z: centerOfElement(r.element) || ((t.match(/\b(Z[A-Z]{2})\b/) || [])[1]) || null }; }, 'afp');
+    if (x) afps.push({ kind: 'afp', code: String(r.element || '').split('/')[0].trim() || 'AFP' + r.n, center: x.z, day: r.day, t: sentTime(r.sent), period: x.p, category: x.c });
   }
-  if (req.skipped) notes.push('time budget reached: ' + req.skipped + ' reroute/closure/AFP detail page(s) not read — their reasons count as unverified');
-  return { reasons, closures, afps, notes, req };
+  return { advs, programs, closures, reasons, afps };
+}
+// The one count rule: an airport program group is kind + airport + day; its cause is the most frequent among its
+// advisories; the weather programs of a day are its groups with the cause WEATHER. Both views' North America day bar.
+const faaStamp = () => L.stamp('faa-restrictions', { ids: ARTCC_IDS, oconus: ARTCC_OCONUS });
+function programCauses(advs) {
+  const cats = {};
+  (advs || []).filter(a => a.kind === 'gs' || a.kind === 'gdp').forEach(a => { const k = a.kind + '|' + a.code + '|' + a.day, c = cats[k] || (cats[k] = {}); c[a.category] = (c[a.category] || 0) + 1; });
+  const catOf = {}, wxByDay = {};
+  Object.keys(cats).forEach(k => { catOf[k] = Object.keys(cats[k]).sort((a, b) => cats[k][b] - cats[k][a])[0];
+    if (catOf[k] === 'WEATHER') { const d = k.split('|')[2]; wxByDay[d] = (wxByDay[d] || 0) + 1; } });
+  return { catOf, wxByDay };
 }
 
 // The digest lines for the prompt: plain, short, the numbers a manager would quote.
@@ -537,9 +579,10 @@ function artccLines(a) {
   return L;
 }
 
-async function fetchFaa({ from, to, week }) {
-  const t0 = Date.now(); REQUESTS = 0;
-  const today = U.today(), oldest = U.addDays(today, -14);
+//   fetchFaa({ from, to, week })   nowMs, pauseMs: tests only (the golden tests, scripts/golden/)
+async function fetchFaa({ from, to, week, nowMs, pauseMs }) {
+  const t0 = Date.now(); REQUESTS = 0; pauseNow = pauseMs != null ? pauseMs : PAUSE_MS;
+  const today = nowMs == null ? U.today() : new Date(nowMs).toISOString().slice(0, 10), oldest = U.addDays(today, -14);
   if (from < oldest) throw new Error('the advisories database keeps 14 days; ' + from + ' is older than ' + oldest + ' — the week would be incomplete');
   const notes = [], rows = [], days = [];
   for (let d = from; d <= to && d <= today; d = U.addDays(d, 1)) {
@@ -552,36 +595,41 @@ async function fetchFaa({ from, to, week }) {
   }
   if (to > today) notes.push('the window runs to ' + to + '; advisories are read up to today, ' + today);
 
-  // Details: every ground stop and ground delay program advisory, every oceanic closure, and the
-  // last Operations Plan of each day.
-  const programs = {}, advs = [];
-  for (const r of rows.filter(x => (x.kind === 'gs' || x.kind === 'gdp') && x.link)) {
-    const p = parseProgram(adviceText(await get(r.link)));
-    const airport = p.airport || r.element.split('/')[0];
-    const k = r.kind + '|' + airport + '|' + r.day;
-    advs.push({ kind: r.kind, code: airport, day: r.day, t: sentTime(r.sent), period: parsePeriod(r.day, p.period), category: p.category });
-    const g = programs[k] || (programs[k] = { type: r.kind === 'gs' ? 'GS' : 'GDP', airport, date: r.day, advisories: 0,
-      categories: {}, conditions: [], maxDelay: 0, avgDelay: 0, totalDelay: 0, comments: [], url: r.link });
-    g.advisories++;
-    g.categories[p.category] = (g.categories[p.category] || 0) + 1;
-    if (p.condition && g.conditions.indexOf(p.condition) < 0) g.conditions.push(p.condition);
-    g.maxDelay = Math.max(g.maxDelay, p.maxDelay || 0); g.avgDelay = Math.max(g.avgDelay, p.avgDelay || 0);
-    g.totalDelay = Math.max(g.totalDelay, p.totalDelay || 0);
-    if (p.comment && g.comments.length < 6 && g.comments.indexOf(p.comment) < 0) g.comments.push(p.comment);
-  }
+  // Details: every ground stop and ground delay program advisory and every oceanic closure (both must be read: an
+  // unreadable page fails the snapshot), then reroute reasons, Gulf closures and airspace flow programs within the time
+  // budget (what is left counts as unverified) — one reader with the relay (readAdvisories). Then the Operations Plans.
+  const softS = (U.MAX_SECONDS['fetch-faa'] || 480) - 90, deadline = t0 + softS * 1000;
+  const programs = {}, oceanic = [], exNotes = [], exReq = { reroute: 0, closure: 0, afp: 0, skipped: 0 };
+  const EXTRA_NOTE = { reroute: r => 'reroute ' + ((parseRerouteTitle(r.title) || {}).name || r.n) + ' of ' + r.day, closure: r => 'Gulf route closure of ' + r.day,
+                       afp: r => 'airspace flow program ' + r.n + ' of ' + r.day };
+  const detail = async (r, reduce, phase) => {
+    if (phase === 'program' || phase === 'oceanic') return reduce(adviceText(await get(r.link)));
+    if (Date.now() > deadline) { exReq.skipped++; return null; }
+    try { const x = reduce(adviceText(await get(r.link))); exReq[phase]++; return x; }
+    catch (e) { exNotes.push(EXTRA_NOTE[phase](r) + ' unreadable: ' + e.message); return null; }
+  };
+  const rd = await readAdvisories(rows, detail, { keepCodes: true,
+    onProgram: (r, p, airport) => {
+      const k = r.kind + '|' + airport + '|' + r.day;
+      const g = programs[k] || (programs[k] = { type: r.kind === 'gs' ? 'GS' : 'GDP', airport, date: r.day, advisories: 0,
+        categories: {}, conditions: [], maxDelay: 0, avgDelay: 0, totalDelay: 0, comments: [], url: r.link });
+      g.advisories++;
+      g.categories[p.category] = (g.categories[p.category] || 0) + 1;
+      if (p.condition && g.conditions.indexOf(p.condition) < 0) g.conditions.push(p.condition);
+      g.maxDelay = Math.max(g.maxDelay, p.maxDelay || 0); g.avgDelay = Math.max(g.avgDelay, p.avgDelay || 0);
+      g.totalDelay = Math.max(g.totalDelay, p.totalDelay || 0);
+      if (p.comment && g.comments.length < 6 && g.comments.indexOf(p.comment) < 0) g.comments.push(p.comment);
+    },
+    onOceanic: (r, ot) => { const o = parseOceanic(ot);
+      if (o && !oceanic.some(x => x.date === r.day && x.routes === o.routes && x.reason === o.reason)) oceanic.push(Object.assign({ date: r.day, facility: r.element }, o)); } });
+  if (exReq.skipped) exNotes.push('time budget reached: ' + exReq.skipped + ' reroute/closure/AFP detail page(s) not read — their reasons count as unverified');
+  const advs = rd.advs, causes = programCauses(advs);
   const progs = Object.values(programs).map(g => Object.assign(g, {
     category: Object.keys(g.categories).sort((a, b) => g.categories[b] - g.categories[a])[0] || 'UNSPECIFIED',
     name: AIRPORTS[g.airport] || g.airport }));
   if (rows.some(x => x.kind === 'gs' || x.kind === 'gdp') && !progs.length) throw new Error('ground stop / delay program pages parsed to nothing — the advisory page changed');
   if (progs.length && progs.every(g => g.category === 'UNSPECIFIED')) notes.push('no IMPACTING CONDITION parsed on any program — causes are missing');
 
-  const oceanic = [], closures = [];
-  for (const r of rows.filter(x => x.kind === 'oceanic' && x.link)) {
-    const ot = adviceText(await get(r.link)), o = parseOceanic(ot);
-    const cx = parseClosure(ot); if (!cx.facilities.length && centerOfElement(r.element)) cx.facilities.push(centerOfElement(r.element));
-    if (cx.reason) closures.push(Object.assign({ day: r.day }, cx));
-    if (o && !oceanic.some(x => x.date === r.day && x.routes === o.routes && x.reason === o.reason)) oceanic.push(Object.assign({ date: r.day, facility: r.element }, o));
-  }
   // The first plan of a day is the plan for the day, the last one how it ended: both are read for
   // their weather constraints; the last one also for staffing and the narrative, as before.
   const staffing = []; let outlook = null; const wxPlan = {};
@@ -621,7 +669,7 @@ async function fetchFaa({ from, to, week }) {
   for (let d = from; d <= to && d <= today; d = U.addDays(d, 1)) {
     const wp = progs.filter(g => g.date === d && g.category === 'WEATHER');
     const w = wxPlan[d] || { terminal: {}, enroute: {} };
-    wxDays.push({ date: d, programs: wp.length, airports: Array.from(new Set(wp.map(g => g.airport))),
+    wxDays.push({ date: d, programs: causes.wxByDay[d] || 0, airports: Array.from(new Set(wp.map(g => g.airport))),
       conditions: Array.from(new Set([].concat.apply([], wp.map(g => g.conditions)))).filter(c => /^WEATHER/.test(c)).slice(0, 6),
       maxDelay: wp.reduce((m, g) => Math.max(m, g.maxDelay), 0),
       terminal: Object.keys(w.terminal).map(k => ({ what: k, where: w.terminal[k] })),
@@ -631,16 +679,13 @@ async function fetchFaa({ from, to, week }) {
   // ---- weather traffic restrictions per ARTCC and airport (round 4) ----
   let artcc = null;
   try {
-    const softS = (U.MAX_SECONDS['fetch-faa'] || 480) - 90;
-    const ex = await fetchArtccDetails(rows, t0 + softS * 1000);
-    const catOf = {}; progs.forEach(g => { catOf[(g.type === 'GS' ? 'gs' : 'gdp') + '|' + g.airport + '|' + g.date] = g.category; });
-    artcc = aggregateArtcc({ dates: days.map(d => d.date), rows, advs: advs.concat(ex.afps), catOf, reasons: ex.reasons,
-      closures: closures.concat(ex.closures), wxPlan });
-    artcc.notes = ex.notes.concat(artcc.notes);
+    artcc = aggregateArtcc({ dates: days.map(d => d.date), rows, advs: advs.concat(rd.afps), catOf: causes.catOf, reasons: rd.reasons,
+      closures: rd.closures, wxPlan });
+    artcc.notes = exNotes.concat(artcc.notes);
     artcc = Object.assign({ source: 'FAA ATCSCC Advisories Database', url: FORM, licence: 'US Government work, public domain (17 U.S.C. § 105)',
       attribution: 'Source: FAA Air Traffic Control System Command Center advisories (public domain). Not for operational use.',
       positions: 'OurAirports airports.csv (public domain), via the project airport list and the table in fetch-faa.js' }, artcc,
-      { requests: Object.assign({ extra: ex.req.reroute + ex.req.closure + ex.req.afp }, ex.req) });
+      { requests: Object.assign({ extra: exReq.reroute + exReq.closure + exReq.afp }, exReq), producer: faaStamp() });
   } catch (e) { notes.push('ARTCC weather block failed: ' + e.message); }
 
   // ---- aggregates ----
@@ -724,8 +769,6 @@ async function fetchFaa({ from, to, week }) {
 const FAA_CACHE_VERSION = 1;
 const OURAIRPORTS_CSV = 'https://davidmegginson.github.io/ourairports-data/airports.csv';
 const RELAY_CANADA_NOTE = 'NAV CANADA publishes no reusable delay or flow data (terms: personal, non-commercial use only). Canadian FIRs are "no public data", not "no restrictions".';
-const causeWord = s => (/^[A-Z][A-Z-]{1,19}$/.test(String(s || '')) ? String(s) : 'OTHER');
-const elementTokens = el => (String(el || '').split('/')[0].match(/\b[A-Z0-9]{3,4}\b/g) || []);
 
 // OurAirports airports.csv -> { code: { lat, lon } } for the wanted codes: ICAO ident first, then the FAA identifier
 // (local_code) of the US and its territories, then the IATA code; a larger airport wins a tie. Positions to 0.01°.
@@ -797,7 +840,7 @@ async function fetchFaaObserved({ from, to, cache, softDeadlineS, nowMs: nowArg,
   if (!n.lists) throw new Error('no advisory list read: ' + notes.slice(0, 2).join('; '));
   rows.sort((a, b) => (a.day === b.day ? a.n - b.n : (a.day < b.day ? 1 : -1)));
   // A detail page: from the cache, else read and reduced to what the layer needs (nothing past the soft deadline).
-  const detail = async (r, reduce) => {
+  const detail = async (r, reduce) => {          // the phase (third argument) does not matter here: every page is cached
     const k = r.day + '#' + r.n;
     if (A[k]) return A[k];
     if (prev.adv[k]) { n.reused++; return (A[k] = prev.adv[k]); }
@@ -805,48 +848,11 @@ async function fetchFaaObserved({ from, to, cache, softDeadlineS, nowMs: nowArg,
     try { const t = adviceText(await getP(r.link)); n.details++; return (A[k] = reduce(t)); }
     catch (e) { incomplete.add(r.day); if (notes.length < 12) notes.push('advisory ' + r.n + ' of ' + r.day + ' unreadable: ' + msg(e)); return null; }
   };
-  const reasonWord = s => (s ? (/^WEATHER/.test(s) ? 'WEATHER' : 'OTHER') : null);
-  const zOnly = a => (a || []).filter(z => /^(Z[A-Z]{2}|CZ[A-Z])$/.test(z));
-  // Ground stops and delay programs.
-  const advs = [], gsRows = [];
-  for (const r of rows.filter(x => (x.kind === 'gs' || x.kind === 'gdp') && x.link)) {
-    const x = await detail(r, t => { const p = parseProgram(t), i = p.airport ? elementTokens(r.element).indexOf(p.airport) : 0;
-      return Object.assign({ c: causeWord(p.category), p: parsePeriod(r.day, p.period) }, i > 0 ? { a: i } : {}, i < 0 ? { a: -1 } : {}); });
-    if (!x) continue;
-    const tk = elementTokens(r.element), code = x.a > 0 && tk[x.a] ? tk[x.a] : (x.a === -1 ? String(r.element || '').split('/')[0].trim() : (tk[0] || String(r.element || '').split('/')[0].trim()));
-    advs.push({ kind: r.kind, code, day: r.day, t: sentTime(r.sent), period: x.p, category: x.c });
-    gsRows.push({ x, code, key: r.kind + '|' + code + '|' + r.day });
-  }
-  // Route closures (oceanic, then the Gulf groups), reroute reasons, airspace flow programs.
-  const closures = [], reduceClosure = t => { const cx = parseClosure(t); return { f: zOnly(cx.facilities), wx: cx.wx, n: cx.reason ? 1 : 0 }; };
-  const addClosure = (r, x) => { const f = x.f.slice(); if (!f.length && centerOfElement(r.element)) f.push(centerOfElement(r.element)); closures.push({ day: r.day, facilities: f, wx: x.wx }); };
-  for (const r of rows.filter(x => x.kind === 'oceanic' && x.link)) { const x = await detail(r, reduceClosure); if (x && x.n) addClosure(r, x); }
-  const reasons = {};
-  for (const g of rerouteGroups(rows)) {
-    if (!g.areas.some(a => ARTCC_IDS.indexOf(a) >= 0 || ARTCC_OCONUS.indexOf(a) >= 0)) continue;
-    for (const r of g.rows.filter(x => x.link).slice(0, 2)) {
-      const x = await detail(r, t => ({ r: reasonWord(parseReroute(t).reason) }));
-      if (!x) break;
-      if (x.r) { reasons[g.key] = x.r; break; }
-    }
-  }
-  for (const g of closureGroups(rows)) {
-    for (const r of g.rows.slice(0, 2)) { const x = await detail(r, reduceClosure); if (!x) break; if (x.n) { addClosure(r, x); break; } }
-  }
-  const afps = [];
-  for (const r of rows.filter(x => x.kind === 'afp' && x.link && !/PROPOSED/.test(x.title))) {
-    const x = await detail(r, t => { const p = parseProgram(t);
-      return { c: causeWord(p.category), p: parsePeriod(r.day, p.period), z: centerOfElement(r.element) || ((t.match(/\b(Z[A-Z]{2})\b/) || [])[1]) || null }; });
-    if (x) afps.push({ kind: 'afp', code: String(r.element || '').split('/')[0].trim() || 'AFP' + r.n, center: x.z, day: r.day, t: sentTime(r.sent), period: x.p, category: x.c });
-  }
+  const rd = await readAdvisories(rows, detail);
+  const advs = rd.advs, gsRows = rd.programs, afps = rd.afps;
   if (n.skipped) notes.push('time budget reached: ' + n.skipped + ' advisory page(s) not read yet — the next run reads them; those days are marked incomplete');
   if (blocked) notes.push(blocked);
-  // The cause of each airport program group (most frequent among its advisories, as fetchFaa decides it).
-  const cats = {};
-  advs.forEach(a => { const k = a.kind + '|' + a.code + '|' + a.day, c = cats[k] || (cats[k] = {}); c[a.category] = (c[a.category] || 0) + 1; });
-  const catOf = {}, wxProg = {};
-  Object.keys(cats).forEach(k => { catOf[k] = Object.keys(cats[k]).sort((a, b) => cats[k][b] - cats[k][a])[0];
-    if (catOf[k] === 'WEATHER') { const d = k.split('|')[2]; wxProg[d] = (wxProg[d] || 0) + 1; } });
+  const { catOf, wxByDay: wxProg } = programCauses(advs);
   // Positions: the table, then what an advisory of the same airport already resolved, then OurAirports (one download).
   // Only airports with a weather program are drawn, so only they are looked up; q: 0 = looked up, no position.
   const posOf = {}, noPos = new Set();
@@ -859,7 +865,7 @@ async function fetchFaaObserved({ from, to, cache, softDeadlineS, nowMs: nowArg,
     catch (e) { notes.push('airport positions not read (OurAirports): ' + msg(e)); }
   } else if (need.length && !positionsUrl) need.forEach(c => noPos.add(c));
   gsRows.forEach(({ x, code }) => { if (posOf[code]) x.q = [posOf[code].lat, posOf[code].lon]; else if (noPos.has(code)) x.q = 0; });
-  const art = aggregateArtcc({ dates, rows, advs: advs.concat(afps), catOf, reasons, closures, wxPlan: {}, pos: c => posOf[c] || null });
+  const art = aggregateArtcc({ dates, rows, advs: advs.concat(afps), catOf, reasons: rd.reasons, closures: rd.closures, wxPlan: {}, pos: c => posOf[c] || null });
   // The public shape: no airport code or name anywhere.
   const complete = d => d < today && !incomplete.has(d);
   const days = art.days.map(d => { const centers = {};
@@ -884,7 +890,7 @@ async function fetchFaaObserved({ from, to, cache, softDeadlineS, nowMs: nowArg,
     positions: positionsUrl ? 'OurAirports airports.csv (public domain), ' + positionsUrl : 'the airport table in fetch-faa.js',
     scope: 'weather restrictions only: per day and ARTCC, and per airport its position (no airport codes or names)',
     ids: ARTCC_IDS.slice(), oconus: ARTCC_OCONUS.slice(), canada: 'no public data', canadaNote: RELAY_CANADA_NOTE,
-    days, airports, weather: { days: days.map(d => ({ date: d.date, programs: d.programs })) }, notes,
+    days, airports, weather: { days: days.map(d => ({ date: d.date, programs: d.programs })) }, notes, producer: faaStamp(),
     requests: n, seconds, summary: [from + ' .. ' + to + ' · ' + rows.length + ' advisories · ' + Object.values(wxProg).reduce((a, b) => a + b, 0) + ' weather programs · ' +
       airports.length + ' airports placed · ' + (n.lists + n.details + n.positions) + ' requests (' + n.reused + ' pages from the cache) · ' + seconds + ' s'] };
 }
@@ -977,5 +983,7 @@ module.exports = { classify, parseList, adviceText, parseProgram, parseOceanic, 
   advTime, parsePeriod, sentTime, parseRerouteTitle, parseReroute, parseClosure, programWindows, windowPortions, rerouteGroups, closureGroups,
   aggregateArtcc, artccLines, airportPos, ARTCC_IDS,
   // 2026-10-12: the public weather relay's days so far
-  fetchFaaObserved, ourAirportsPositions, readFaaCache, OURAIRPORTS_CSV };
+  fetchFaaObserved, ourAirportsPositions, readFaaCache, OURAIRPORTS_CSV,
+  // 2026-10-20: the weekly producer itself, for the golden tests (scripts/golden/)
+  fetchFaa };
 if (require.main === module) U.main('fetch-faa', 'faa', fetchFaa, digest);

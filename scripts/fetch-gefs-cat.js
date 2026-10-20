@@ -43,6 +43,7 @@
 const fs = require('fs');
 const path = require('path');
 const U = require('./fetch-util.js');
+const L = require('./wx-layers.js');        // the weather layer registry: producer stamp (ADR-001)
 const WX = require('./fetch-wxoutlook.js');      // decodeGrib2, pool (shared, read-only)
 const D = require('./sigwx-diag.js');
 const SM = require('./fetch-sigwx-model.js');   // AREAS, WORK, OG, BANDS, CAT_FIXED: the same frames and threshold
@@ -319,6 +320,7 @@ async function fetchGefsCat({ to, backfill }) {
   out.summary = ['run ' + out.run + ' · ' + days.length + ' days (' + (days[0] ? days[0].date : '?') + ' .. ' + (days.length ? days[days.length - 1].date : '?') + ', +' + plan[0].lead + '..+' + plan[plan.length - 1].lead + ' h) × 3 frames × 3 bands · members ' +
                  days.map(d => d.members).join('/') + (failed.length ? ' · ' + failed.length + ' member files failed' : '') + ' · requests ' + st.requests + ' · ' + mb + ' MB · ' + out.seconds + ' s · snapshot ' +
                  Math.round(out.snapshotBytes / 1024) + ' KB compact' + (agree != null ? ' · control own vs mean heights: ' + agree + ' % of cells agree' : '')];
+  out.producer = L.stamp('gefscat', { levels: LEVELS, threshold: THRESHOLD, members: MEMBERS, minMembers: MIN_MEMBERS });
   return out;
 }
 

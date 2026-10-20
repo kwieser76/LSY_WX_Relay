@@ -9,6 +9,7 @@
 'use strict';
 
 const U = require('./fetch-util.js');
+const L = require('./wx-layers.js');        // the weather layer registry: producer stamp (ADR-001)
 
 // The NAT track message as the FAA NOTAM system publishes it (nat.json: one object per part, the text
 // in condition_message). EGGX (Shanwick) issues the westbound system, CZQX (Gander) the eastbound one.
@@ -57,7 +58,7 @@ const NAT_PAGE = 'https://nms.aim.faa.gov/nat';
 async function fetchNatLive(notes) {
   try {
     const sets = parseNatMessage(JSON.parse(await U.getText(NAT_JSON, { accept: 'application/json', timeoutMs: 20000, retries: 1 })));
-    const live = { fetchedAt: new Date().toISOString(), page: NAT_PAGE, sets };
+    const live = { fetchedAt: new Date().toISOString(), page: NAT_PAGE, sets, producer: L.stamp('nat-message', null) };
     if (!sets.length || !sets.some(x => x.tracks.length)) notes.push('NAT track message read, but no tracks parsed — the format may have changed');
     return live;
   } catch (e) { notes.push('NAT track message unreadable: ' + e.message); return null; }

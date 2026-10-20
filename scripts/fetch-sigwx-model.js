@@ -53,6 +53,7 @@
 const fs = require('fs');
 const path = require('path');
 const U = require('./fetch-util.js');
+const L = require('./wx-layers.js');        // the weather layer registry: producer stamp (ADR-001)
 const WX = require('./fetch-wxoutlook.js');      // decodeGrib2, getBuffer, getRange (shared, read-only)
 const D = require('./sigwx-diag.js');
 
@@ -215,11 +216,14 @@ function cbOf(f) {
 // pastOnly (the relay's This-week part, fetchSigwxModelObserved): the analyses of the past days only, no week
 // ahead; dates = the days to read instead of from..to; CAT always with the fixed thresholds, so a day read on
 // one run matches a day read on another. Absent = unchanged.
+// One stamp for the Monday snapshot, the relay's forecast days and This week's analyses (scripts/wx-layers.js).
+const modelStamp = calibration => L.stamp('sigwx-model', { calibration, catFixed: CAT_FIXED, bands: BANDS, res: RES, areas: AREAS });
 async function fetchSigwxModel({ to, from, backfill, aheadOnly, pastOnly, dates }) {
   const t0 = Date.now(), nowMs = Date.now(), notes = [];
-  const cfg = (U.readConfig().sigwxModel) || {};
+  // S8 (2026-10-20): the calibration of the registry ("fixed"), the same for the Monday run and the relay; config.json is
+  // no longer read for it. --cat-calibration percentile stays for a trial by hand (its stamp then differs).
   const cliCal = U.cli(process.argv).argOf('--cat-calibration');
-  const calibration = !pastOnly && (cliCal || cfg.catCalibration) === 'percentile' ? 'percentile' : 'fixed';
+  const calibration = !pastOnly && (cliCal || L.profile('sigwx-model').catCalibration) === 'percentile' ? 'percentile' : 'fixed';
   const forceAws = U.cli(process.argv).has('--archive-only');
   const hits = { [HOST.nomads]: 0, [HOST.aws]: 0 }, bytes = { [HOST.nomads]: 0, [HOST.aws]: 0 }, dead = {};
   const nomadsErrors = [];
@@ -377,6 +381,7 @@ async function fetchSigwxModel({ to, from, backfill, aheadOnly, pastOnly, dates 
   };
   if (aheadOnly) out.aheadOnly = true;
   if (pastOnly) out.pastOnly = true;
+  out.producer = modelStamp(calibration);
   out.seconds = Math.round((Date.now() - t0) / 1000);
   out.snapshotBytes = Buffer.byteLength(JSON.stringify(out));
   const nDays = areas.atl.days.length;
@@ -477,7 +482,7 @@ async function fetchSigwxModelObserved({ from, to, cache, nowMs }) {   // nowMs:
            encoding: { cat: 'rle "v*n,v" of classes 0/1/2', trop: 'base64, one byte per point, FL = v*5, 0 = missing', cbExtent: 'rle of CB cover in tenths 0–8', cbTopFL: 'base64 FL/5 of the highest CB top in the cell, 0 = none', jets: 'path [[lat, lon, kt], …] in flow order, 0.1°' },
            cat: { calibration: 'fixed', thresholds: Object.fromEntries(AREA_IDS.map(a => [a, Object.fromEntries(BANDS.map(b => [b, CAT_FIXED.slice()]))])), units: '1e-7 s^-2', wording: 'potential, never a moderate/severe grade' },
            past: { from, to, hour: '12Z', kind: 'GFS analyses (f000)' }, areas, missing,
-           requests: r ? r.requests : {}, notes, seconds,
+           requests: r ? r.requests : {}, notes, seconds, producer: modelStamp('fixed'),
            summary: [from + ' .. ' + to + ' · ' + dates.length + ' day(s) (' + (all.length - open.length) + ' from the cache) · ' + fetched + ' requests · ' + seconds + ' s'] };
 }
 

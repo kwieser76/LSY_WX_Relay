@@ -23,6 +23,7 @@
 'use strict';
 
 const U = require('./fetch-util.js');
+const L = require('./wx-layers.js');        // the weather layer registry: producer stamp (ADR-001)
 const WX = require('./fetch-wxoutlook.js');   // decodeGrib2, getBuffer, getRange, nearestIndex, pool (pure helpers)
 
 const HOST = 'https://noaa-gefs-pds.s3.amazonaws.com';
@@ -184,7 +185,7 @@ async function fetchDust({ backfill, hubs }) {
     res: GRID.res, lat0: GRID.lat0, lon0: GRID.lon0, nlat: GRID.nlat, nlon: GRID.nlon, encoding: 'rle',
     layout: 'row-major, south→north rows, west→east columns; cell value = class of the day\'s maximum over the 00/06/12/18Z steps and the 2x2 0.25° points in the cell',
     classes: CLASSES, outlook: { from: dates[0], to: dates[dates.length - 1] },
-    days, hubs: hubRows, areas, attribution: ATTRIBUTION,
+    days, hubs: hubRows, areas, attribution: ATTRIBUTION, producer: L.stamp('dust', { grid: GRID, edges: EDGES, classes: CLASSES }),
     licence: { text: 'NOAA data, public domain: "open to the public and can be used as desired" (AWS Registry of Open Data).', url: 'https://registry.opendata.aws/noaa-gefs/' },
     notes, requests: { 'noaa-gefs-pds.s3.amazonaws.com': req.n }, megabytes: Math.round(req.bytes / 1e5) / 10, seconds: Math.round((Date.now() - t0) / 100) / 10,
     summary: ['run ' + cycle.label + ': ' + days.length + ' days (' + fields.length + '/' + steps.length + ' steps), peak AOD ' + (worst ? worst.maxAod + ' on ' + worst.date : '—') +

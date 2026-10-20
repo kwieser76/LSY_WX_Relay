@@ -18,20 +18,20 @@
 //
 // Sources — all anonymous, no key:
 //   NOAA GFS 1° via the NOMADS grib filter, https://nomads.ncep.noaa.gov/cgi-bin/filter_gfs_1p00.pl
-//     One request per forecast step (f012..f168, every 12 h) for one box 24–72N, 125W–45E with
+//     One request per forecast step (f012..f168, every 12 h) for one box (4–75N 170W–82E since round 4) with
 //     u/v at 300, 250 and 200 hPa, CAPE, convective precipitation rate, gust, categorical snow and
 //     visibility: about 140 KB per step (93 KB before 300/200 hPa were added), GRIB2 simple packing
 //     (template 5.0), decoded here without dependencies.
 //     NOMADS allows 120 hits/min per IP; this file paces at >1 s. A cycle not yet on the server
 //     answers 403 "Request for Future Data" — the reason for the one-cycle fallback. The same steps
 //     also give gfs.jetGrid, the wind of each outlook day on a 2° grid for the jet map at 250 hPa
-//     (≈ FL340) and, in byLevel, 300 hPa (≈ FL300) and 200 hPa (≈ FL390) — no extra request; 25–71N
-//     because the box stops at 72N; about 40 KB. The jet figures, ECMWF and the model comparison
+//     (≈ FL340) and, in byLevel, 300 hPa (≈ FL300) and 200 hPa (≈ FL390) — no extra request; 25–75N
+//     like the analyses (the box stopped at 72N, so the grid at 71N, until 2026-10-20); about 43 KB. The jet figures, ECMWF and the model comparison
 //     stay at 250 hPa. The steps the day maps use (one per date) also carry HGT/ICAHT at the
 //     tropopause, max-wind level, 0 °C isotherm and 850/700/500 hPa for gfs.levels (tropopause,
 //     max-wind and freezing level as flight levels, same grid; about 43 KB) — no extra request,
 //     about +320 KB on each of those 7 steps (measured 2026-10-06: NOMADS 1.9 → 4.2 MB).
-//     Since round 4 (2026-10-06) the one box per step is the union of the three map frames, 4–72N 170W–82E
+//     Since round 4 (2026-10-06) the one box per step is the union of the three map frames, 4–75N 170W–82E (72N until 2026-10-20)
 //     (Europe/NAT, North America 13–72N 170W–50W, Middle East 3–47N 14E–82E): no extra request, the same
 //     grids cut per area (gfs.jetGrid.areas.na/me, gfs.levels.areas.na/me), and TMAX at 2 m for a heat flag at
 //     the hubs, per map frame (`area` 'atl' | 'na' | 'me').
@@ -61,6 +61,7 @@
 'use strict';
 
 const U = require('./fetch-util.js');
+const L = require('./wx-layers.js');        // the weather layer registry: producer stamp (ADR-001)
 const AEC = require('./grib-aec.js');
 const CX = require('./grib-complex.js');   // complex packing (5.2/5.3): the NOAA GFS archive on AWS, read by fetch-wxreview.js
 
@@ -76,8 +77,10 @@ const GFS_LAG_H = 5;               // a cycle is tried once it is this old; f168
 // U.main's watchdog, which would write nothing.
 const SOFT_DEADLINE_S = 100;
 const NOMADS_TIMEOUT_MS = 20000, TEXT_TIMEOUT_MS = 15000;
-// One box for every map frame (union of JET_GRID and AREA_JET_GRID below, top 72N as before): 4–72N 170W–82E.
-const GFS_BOX = { top: 72, bottom: 4, left: -170, right: 82 };
+// One box for every map frame (union of JET_GRID and AREA_JET_GRID below): 4–75N 170W–82E, the same box as the GFS
+// analyses of fetch-wxreview.js. Until 2026-10-20 the top was 72N, so the forecast jet and convective grids of the
+// Europe/NAT frame ended at 71N while the analyses reached 75N (ADR-001, "Forecast grid ends at 71N").
+const GFS_BOX = { top: 75, bottom: 4, left: -170, right: 82 };
 const GFS_VARS = ['UGRD', 'VGRD', 'CAPE', 'CPRAT', 'GUST', 'CSNOW', 'VIS', 'TMAX'];
 // 300 and 200 hPa only for the jet map's level choice (UGRD/VGRD are the only fields asked for that exist
 // there); 250 hPa stays next to 'surface' and carries everything else. 2 m only for TMAX (the hub heat flag).
@@ -438,7 +441,7 @@ function jetGridOf(u, v, box) {
   box = Object.assign({}, JET_GRID, box || {});
   if (!u || !v || !u.values || !v.values) return null;
   const sp = (lat, lon) => { const a = valueAt(u, lat, lon), b = valueAt(v, lat, lon); return a == null || b == null ? null : Math.hypot(a, b) * MS_TO_KT; };
-  // Rows the source grid actually covers (the outlook's GFS box stops at 72N).
+  // Rows the source grid actually covers (the outlook's GFS box stopped at 72N until 2026-10-20; now 75N like the analyses).
   const top = Math.min(box.latMax, Math.max(gLat(u, 0), gLat(u, u.nj - 1)));
   const nlat = Math.floor((top - box.lat0) / box.res) + 1, nlon = Math.floor((box.lonMax - box.lon0) / box.res) + 1;
   const bytes = Buffer.alloc(nlat * nlon);
@@ -680,7 +683,7 @@ function levelSteps(cycle, steps, range) {
 // Cells: the grid points of the jet map (JET_GRID / AREA_JET_GRID, so the layers line up), point c covering
 // sources with c − res/2 ≤ lat, lon < c + res/2. Both models are sampled at the same 1° points (ECMWF's
 // 0.25° field thinned to every 4th point), so a cell is never "busier" in one model only because it has
-// 16× the points; atl stops at 71N like the GFS jet grid, so GFS and ECMWF grids have one shape.
+// 16× the points; atl reaches 75N like the GFS jet grid (71N until 2026-10-20), so GFS and ECMWF grids have one shape.
 // A day is the highest class of that date's steps (GFS: two 12-hourly steps; ECMWF: 18 UTC only).
 const CONV_NODATA = 255;
 const CONV_FRAMES = { atl: Object.assign({}, JET_GRID, { latMax: Math.min(JET_GRID.latMax, GFS_BOX.top) }), na: AREA_JET_GRID.na, me: AREA_JET_GRID.me };
@@ -1444,6 +1447,7 @@ async function fetchWxOutlook({ backfill, hubs, ensPoints }) {
   out.summary = ['outlook ' + outlook.from + ' .. ' + outlook.to + ' · ' + okN + '/' + sources.length + ' sources · ' +
                  Object.values(hits).reduce((a, b) => a + b, 0) + ' requests, ' + mb.toFixed(1) + ' MB (' +
                  Object.keys(hits).map(h => h + ' ' + hits[h] + '/' + out.megabytes[h] + ' MB').join(', ') + ') · ' + out.seconds + ' s'];
+  out.producer = L.stamp('wxoutlook', { box: GFS_BOX, grid: JET_GRID, areas: AREA_JET_GRID, conv: CONV_FRAMES, thresholds: THRESHOLDS });
   return out;
 }
 

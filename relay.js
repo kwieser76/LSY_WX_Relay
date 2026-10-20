@@ -71,10 +71,23 @@ const { AsyncLocalStorage } = require('async_hooks');
 
 const SCHEMA = 'lsy-wx-relay/1';
 const SCRIPTS = path.join(__dirname, 'scripts');
+// The weather layer registry (scripts/wx-layers.js, 2026-10-20): the window rule of each part and the producer stamps.
+// Next to relay.js in the packaged copy; in the project (tests) it is the project's own scripts/.
+const LY = (() => { try { return require(path.join(SCRIPTS, 'wx-layers.js')); } catch (e) { return require(path.join(__dirname, '..', '..', 'scripts', 'wx-layers.js')); } })();
 const PART_KEYS = ['wxoutlook', 'sigwx', 'sigwxModel', 'gefscat', 'dust', 'nat', 'since'];
 const SINCE_KEYS = ['wxreview', 'lightning', 'mrms', 'nat', 'gfs', 'faa', 'sigwx'];
-// The sub-parts on the window of at least MIN_DAYS days (extWindowOf), and what the faa part must never carry.
-const SINCE_EXT = ['nat', 'gfs', 'faa', 'sigwx'];
+// The sub-parts on the window of at least MIN_DAYS days (extWindowOf): the registry's layers with window 'ext3'
+// (nat, gfs, faa, sigwx; ADR-001 Q2 kept wxreview, lightning and mrms on Monday to now). And what faa must never carry.
+const SINCE_EXT = SINCE_KEYS.filter(k => LY.sinceExt().includes(k));
+// The producer stamp each part must carry ([path in the part, layer id]); null parts are not checked.
+const STAMPS = {
+  wxoutlook: [['producer', 'wxoutlook']], sigwx: [['producer', 'sigwx-official']], sigwxModel: [['producer', 'sigwx-model']],
+  gefscat: [['producer', 'gefscat']], dust: [['producer', 'dust']], nat: [['producer', 'nat-message']],
+  'since.wxreview': [['us.producer', 'us-convective'], ['spc.producer', 'spc-reports'], ['sigmetGrid.areas.na.producer', 'us-convective']],
+  'since.lightning': [['producer', 'lightning']], 'since.mrms': [['producer', 'mrms']], 'since.nat': [['producer', 'nat-days']],
+  'since.gfs': [['jet.producer', 'gfs-jet'], ['levels.producer', 'gfs-levels']], 'since.faa': [['producer', 'faa-restrictions']],
+  'since.sigwx': [['official.producer', 'sigwx-official'], ['model.producer', 'sigwx-model']],
+};
 const MIN_DAYS = 3;
 const FAA_PRIVATE = ['faa', 'icao', 'code', 'name', 'iata'];
 const BLOCK_HOURS = 24;
@@ -464,6 +477,18 @@ function validate(L) {
     if (lt && !L.attribution.some(a => /^Contains modified EUMETSAT Meteosat product \d{4}/.test(a))) P.push('attribution: EUMETSAT credit line missing');
     if (si.mrms && !/NOAA MRMS/.test(si.mrms.attribution || '')) P.push('since.mrms attribution missing');
   }
+  // Producer stamps (scripts/wx-layers.js, 2026-10-20): every layer in the file says which producer and parameters made it,
+  // so the page and the tests can tell that This week and the Briefing week came from the same code. A sub-object that is
+  // null (a source that failed) needs none.
+  const getP = (o, p) => p.split('.').reduce((x, k) => (x == null ? x : x[k]), o);
+  Object.keys(STAMPS).forEach(k => {
+    const part = k.startsWith('since.') ? (parts.since || {})[k.slice(6)] : parts[k];
+    if (!part) return;
+    STAMPS[k].forEach(([p, id]) => {
+      if (p.indexOf('.') >= 0 && getP(part, p.split('.').slice(0, -1).join('.')) == null) return;
+      if (!LY.isStamp(getP(part, p), id)) P.push(k + '.' + p + ': producer stamp of layer ' + id + ' missing or malformed (scripts/wx-layers.js)');
+    });
+  });
   if (!Array.isArray(L && L.attribution) || !L.attribution.length || L.attribution.some(a => typeof a !== 'string')) P.push('attribution must be a list of strings');
   if (!L || typeof L.disclaimer !== 'string' || !/NOT FOR OPERATIONAL USE/.test(L.disclaimer)) P.push('disclaimer must say NOT FOR OPERATIONAL USE');
   return P;
@@ -609,7 +634,7 @@ function checkBlocked(file, nowMs) {
   return act.length ? 1 : 0;
 }
 
-module.exports = { SCHEMA, PART_KEYS, SINCE_KEYS, SINCE_EXT, MIN_DAYS, BLOCK_HOURS, ATTRIBUTION, ATTRIBUTION_SINCE, DISCLAIMER, windowOf, sinceWindowOf, extWindowOf, isoWeekOf,
+module.exports = { SCHEMA, PART_KEYS, SINCE_KEYS, SINCE_EXT, STAMPS, MIN_DAYS, BLOCK_HOURS, ATTRIBUTION, ATTRIBUTION_SINCE, DISCLAIMER, windowOf, sinceWindowOf, extWindowOf, isoWeekOf,
                    finishPart, validate, assemble, loadCache, cacheName, installFetch, denyList, readBlocked, inForce, blockedNote, headerValues, checkBlocked, main };
 if (require.main === module && process.argv[2] === '--check-blocked') process.exit(checkBlocked(process.argv[3]));
 if (require.main === module) {

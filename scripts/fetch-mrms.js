@@ -39,6 +39,7 @@
 
 const zlib = require('zlib');
 const U = require('./fetch-util.js');
+const L = require('./wx-layers.js');        // the weather layer registry: producer stamp (ADR-001)
 const GP = require('./grib-png.js');
 const H = require('./grid-hours.js');
 
@@ -431,6 +432,7 @@ async function fetchMrms({ from, to, pauseMs, nowMs: nowArg, cache, maxFiles, so
   out.summary = [from + ' .. ' + to + ' · ' + read.length + '/' + frames.length + ' hourly files, ' + hail.size + '/' + dates.length + ' hail files · ' + agg.litCells + ' cells with ≥ ' + DBZ + ' dBZ · max ' +
                  agg.max + ' h/day, ' + agg.weekMax + ' h/week' + (top ? ' · most over ' + top.area + ' (peak ' + top.peakDate + ')' : '') + (hailMax ? ' · hail up to ' + hailMax + ' mm' : '') +
                  ' · ' + hits + ' requests, ' + out.megabytes + ' MB · ' + out.seconds + ' s'];
+  out.producer = L.stamp('mrms', JSON.parse(cacheParams()));
   return out;
 }
 
