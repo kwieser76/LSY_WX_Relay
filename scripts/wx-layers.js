@@ -32,6 +32,12 @@ const LAYERS = {
     // S8: the CAT calibration is pinned here, no longer read from config.json (the Monday run read it there, the relay
     // from its own copy; "percentile" in one of them would have drawn the same day differently).
     profile: { catCalibration: 'fixed', pastHourUtc: 12 } },
+  'contrails': { producer: 'fetch-contrails.js fetchContrails / fetchContrailsObserved', version: 1, privacy: 'public', window: 'ext3', relay: ['contrails', 'since.contrails'],
+    // 2026-10-21 (Kurt): Schmidt-Appleman criterion plus near-ice-saturation (RHi >= 0.95, GFS caps RH at 100 %) on the three
+    // flight levels of ADR-001 Q1; classes to +72 h like CAT; a typical turbofan, no aircraft type.
+    profile: { levels: ['300', '250', '200'], hourUtc: 12, criterion: 'SAC + RHi threshold',
+               aircraft: { eta: 0.3, eiH2o: 1.23, qFuel: 43.13e6, cp: 1004, eps: 0.622, eSat: 'MK05' },
+               thresholds: { rhiPersistent: 0.95, minPts: 5 }, leadMaxH: 72 } },
   'gfs-jet': { producer: 'fetch-wxreview.js readGfsDay → fetch-wxoutlook.js jetLevels (fetchWxReview jetChain, fetchGfsObserved)', version: 1, privacy: 'public', window: 'ext3', relay: ['since.gfs'],
     // ADR-001 Q1: FL300, FL340 and FL390 in every view.
     profile: { levels: ['300', '250', '200'], hourUtc: 0, cycle: '00Z analysis (f000), NOMADS, else the AWS archive' } },

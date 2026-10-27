@@ -4,9 +4,10 @@ A small scheduled job that fetches **public weather model and forecast data for 
 **today's North Atlantic track message** and **the observed weather of the current week so far** (US
 convective SIGMETs, US storm reports, satellite lightning over Europe and the Middle East, US radar storm
 hours; and, over at least the last three days, the North Atlantic tracks of each day, the GFS jet stream at
-FL340 with tropopause, max-wind and freezing level, and the US weather traffic restrictions) and publishes it
-as one compact JSON file. A weather map uses that file for an explicit "refresh"
-button, so the map can show newer data than it was built with.
+FL300/340/390 with tropopause, max-wind and freezing level, the US weather traffic restrictions, the SIGWX of
+each day and the model-derived contrail classes of each day) and publishes it as one compact JSON file. A
+weather map uses that file for an explicit "refresh" button, so the map can show newer data than it was
+built with.
 
 > **Not for operational use.** This is model and forecast data, reformatted and partly derived by this
 > relay. It is not a flight-planning, dispatch or pilot-briefing product and not an official
@@ -30,13 +31,14 @@ GitHub Actions, 04:30, 10:30, 16:30 and 22:30 UTC, a backup slot 71 min after ea
 - `main` holds the code: `relay.js`, the fetchers and decoders in `scripts/` (Node 20, no
   dependencies), `config.json`, `privacy-check.js` and the workflow `.github/workflows/wx-relay.yml`.
 - `data` holds `latest.json` and `cache/lightning-<week>.json`, `cache/mrms-<week>.json`, `cache/gfs.json`,
-  `cache/faa.json`, `cache/sigwx.json`. Every run replaces the branch with a single new commit, so the repository does not grow
+  `cache/faa.json`, `cache/sigwx.json`, `cache/contrails.json`. Every run replaces the branch with a single new commit, so the repository does not grow
   and the URL always points at the newest file. The caches hold what earlier runs already read: the
   lightning frames and radar hours of the current ISO week (reduced to 0.5° cells), the reduced GFS analyses
   of the last days, and per FAA advisory (keyed by day and advisory number) the cause, period and airport
-  position it gave, and the SIGWX charts of the last days (official and model-derived). A run downloads only
-  what is new; the week caches are dropped when the week changes, `gfs.json`, `faa.json` and `sigwx.json` keep
-  the days of the current window only, and a missing or broken cache only
+  position it gave, the SIGWX charts of the last days (official and model-derived) and the contrail classes
+  of the last days. A run downloads only
+  what is new; the week caches are dropped when the week changes, `gfs.json`, `faa.json`, `sigwx.json` and
+  `contrails.json` keep the days of the current window only, and a missing or broken cache only
   means that run starts fresh.
 - A run that fails completely (every source failed, or the privacy check found something) publishes
   nothing; the previous `latest.json` stays. A single source that fails becomes `null` in the file, with
@@ -60,10 +62,11 @@ GitHub Actions, 04:30, 10:30, 16:30 and 22:30 UTC, a backup slot 71 min after ea
 | `parts.wxoutlook` | GFS jets and flight levels (tropopause, max wind, freezing level), convective potential (GFS and ECMWF), GFS vs ECMWF by day, SPC day 1–8 outlook areas, NHC/CPHC and JTWC tropical cyclones, WPC/CPC hazards, SWPC space weather |
 | `parts.sigwx` | official WAFS SIGWX (FL100–600) of the newest run: the 12Z charts up to T+48 |
 | `parts.sigwxModel` | model-derived SIGWX from GFS for the 7 days: jets and tropopause; CAT potential and CB to +72 h |
+| `parts.contrails` | model-derived contrail potential from GFS temperature and humidity for the 7 days: per 2° cell and flight level (FL300/340/390) the class 0 none, 1 short-lived contrail possible, 2 persistent contrail possible (Schmidt-Appleman criterion for a typical turbofan plus relative humidity over ice at or above 95 %); classes to +72 h, later days carry dates only. Not an official product |
 | `parts.gefscat` | ensemble CAT probability, days 3–7: the share of the 31 GEFS members whose Ellrod index shows CAT potential |
 | `parts.dust` | dust optical depth classes from GEFS-Aerosols, 5 days |
 | `parts.nat` | today's North Atlantic track message: `{ fetchedAt, page, sets }`, one set per direction with its tracks (route, entry, latitude at 30/40/50W), TMI, split and remarks |
-| `parts.since` | the observed weather of the current ISO week, Monday 00Z to the run: `{ window {from, to, asOf, week}, wxreview, lightning, mrms, nat, gfs, faa, sigwx }` (each null when it failed; `nat`, `gfs`, `faa` and `sigwx` have a window of their own, see below) |
+| `parts.since` | the observed weather of the current ISO week, Monday 00Z to the run: `{ window {from, to, asOf, week}, wxreview, lightning, mrms, nat, gfs, faa, sigwx, contrails }` (each null when it failed; `nat`, `gfs`, `faa`, `sigwx` and `contrails` have a window of their own, see below) |
 | `parts.since.wxreview` | US convective SIGMETs (counts, and a 1° grid over North America of how often a cell lay inside one at the 3-hourly sample moments) and SPC storm reports (per day and as points). Nothing else: no international SIGMETs, no pilot reports, no airport observations |
 | `parts.since.lightning` | EUMETSAT MTG Lightning Imager: per day and 0.5° cell the hours whose sampled frame (one 5-minute frame per hour) showed lightning, Europe/North Atlantic and the Middle East |
 | `parts.since.mrms` | NOAA MRMS: per day and 0.5° cell the hours with radar reflectivity ≥ 40 dBZ, and the day's radar-estimated hail, US |
@@ -71,6 +74,7 @@ GitHub Actions, 04:30, 10:30, 16:30 and 22:30 UTC, a backup slot 71 min after ea
 | `parts.since.gfs` | GFS 00Z analyses of every day of its window: jet at 300, 250 and 200 hPa (FL300/340/390), tropopause, max-wind and freezing level, three map frames |
 | `parts.since.faa` | FAA Command Center weather restrictions per day and ARTCC; airports with weather programs as positions (no codes, no names) |
 | `parts.since.sigwx` | SIGWX of every day of its window at 12Z: the official WAFS chart and the model-derived picture from the GFS 12Z analysis |
+| `parts.since.contrails` | the contrail classes of every day of its window from the GFS 12Z analysis, the same cells, levels and classes as `parts.contrails` |
 | `status.<part>` | `{ ok, error?, seconds, requests, megabytes, hosts }`; the since sub-parts as `status["since.lightning"]` etc., with `cache { reused, fetched }` |
 | `attribution` | the credit lines below; show them with the data |
 | `disclaimer` | the "not for operational use" text |
@@ -79,11 +83,11 @@ Each part keeps its own model run, issue and valid times, label, attribution and
 base64 or run-length encoded as described inside each part. There are no airport-specific values in this
 file.
 
-### The last days: `since.nat`, `since.gfs`, `since.faa`, `since.sigwx` (added 2026-10-12 and 2026-10-13, schema unchanged)
+### The last days: `since.nat`, `since.gfs`, `since.faa`, `since.sigwx`, `since.contrails` (added 2026-10-12, 2026-10-13 and 2026-10-21, schema unchanged)
 
-A reader that knows only the parts above ignores these four; the schema name stays `lsy-wx-relay/1`.
+A reader that knows only the parts above ignores these five; the schema name stays `lsy-wx-relay/1`.
 
-- **Window.** Each of the four has `window { from, to, week, asOf, weekFrom, beforeWeek }`: `to` is the
+- **Window.** Each of the five has `window { from, to, week, asOf, weekFrom, beforeWeek }`: `to` is the
   run's day, `weekFrom` the Monday of the ISO week (= `since.window.from`), `from` the Monday or `to − 2`,
   whichever is earlier, so the window never holds fewer than three days. `beforeWeek` lists the dates before
   the Monday (Monday: Saturday and Sunday; Tuesday: Sunday; otherwise `[]`). Dates are UTC.
@@ -122,6 +126,27 @@ A reader that knows only the parts above ignores these four; the schema name sta
   run; until then it is in `missing` and `notes` ("not yet published"). For today a reader can use the 12Z chart
   of `parts.sigwx.ahead` and the forecast day of `parts.sigwxModel`.
 
+### Contrails: `parts.contrails` and `parts.since.contrails` (added 2026-10-21, schema unchanged)
+
+Model-derived contrail potential, computed by this relay from NOAA GFS 0.5° temperature and humidity. Not an
+official product; not issued or checked by any meteorological authority; not for flight planning or operational
+use. Both parts have the shape of `parts.sigwxModel`: `{ source, label, disclaimer, attribution, pages, model, res: 2,
+areaOrder, layout, encoding, bands { '300' | '250' | '200': { fl, hPa } }, contrail { criterion, persistence, params,
+rhConvention, classes, cell, leadMaxH: 72, wording }, past, ahead, areas { na, atl, me }, missing, requests, notes,
+producer }`. Each frame `areas.*` is `{ name, box, res, lat0, lon0, nlat, nlon, days }`; a day is `{ date, valid, run,
+lead, kind, bands? }` with `bands['300' | '250' | '200'].ctr` the classes of the frame as run-length text `"v*n,v"`
+(row-major, south to north, west to east; 0 no contrail, 1 short-lived contrail possible, 2 persistent contrail
+possible, 255 no data). A cell takes class c when at least 5 of the 25 GFS points within ±1° reach it.
+
+- `parts.contrails`: `kind: 'forecast'` days of the window, from the latest complete GFS cycle (`ahead.run`); days
+  beyond +72 h keep `date`, `valid`, `run`, `lead` and `kind` and have no `bands` key.
+- `parts.since.contrails`: `kind: 'analysis'` days of the window of the last days (same `window` fields as the four
+  parts above), the GFS 12Z analysis of each day, cache `cache/contrails.json`. The 12Z analysis is out at about 17Z;
+  until then today is in `missing` and a reader can use the forecast day of `parts.contrails`.
+- The relay validates: three frames with a grid, days of the kind and window of the part, every `ctr` string of
+  exactly `nlat × nlon` cells. "Persistent contrail possible" means air near ice saturation (GFS never reports
+  humidity above ice saturation), never a forecast that a contrail will form.
+
 ### ECMWF ENS probabilities at neutral points: `parts.wxoutlook.ecmwf.ens.points` (added 2026-10-13)
 
 `{ rule, grid { la1, lo1, di, dj, ni, nj, scan }, n, idx, encoding: 'base64-uint8', missing: 255, days [{ date,
@@ -138,7 +163,7 @@ that index's position in `idx`.
 
 | Source | Used for | Licence / terms |
 |---|---|---|
-| NOAA GFS 1° and 0.5° (NOMADS grib filter; NOAA open data on AWS as fallback) | jets, flight levels, convective potential, model-derived SIGWX | public domain ([weather.gov/disclaimer](https://www.weather.gov/disclaimer)) |
+| NOAA GFS 1° and 0.5° (NOMADS grib filter; NOAA open data on AWS as fallback) | jets, flight levels, convective potential, model-derived SIGWX, model-derived contrail classes (temperature and humidity at 300/250/200 hPa, forecasts and 12Z analyses) | public domain ([weather.gov/disclaimer](https://www.weather.gov/disclaimer)) |
 | NOAA GEFS v12 0.5° (NOAA open data on AWS) | ensemble CAT probability | public domain |
 | NOAA GEFS-Aerosols (NOAA open data on AWS) | dust | public domain |
 | ECMWF IFS HRES open data ([data.ecmwf.int](https://data.ecmwf.int/forecasts)) | 250 hPa wind for the model comparison, convective potential | CC BY 4.0 — "Contains ECMWF Open Data"; values derived (modified) by this relay |
@@ -180,7 +205,7 @@ node relay.js --out out --cache out/cache          # a few minutes; see below fo
 node privacy-check.js out/latest.json out/cache    # exit 1 on a finding
 ```
 
-Options: `--parts wxoutlook,dust,nat,since` (a subset; `since.gfs` etc. for single sub-parts), `--cache DIR` (the caches of the previous run;
+Options: `--parts wxoutlook,contrails,dust,nat,since` (a subset; `since.gfs` etc. for single sub-parts), `--cache DIR` (the caches of the previous run;
 without it the observed week starts fresh), `--deny-file FILE` (hosts never to contact, first field of each
 line; a 403/429 is appended), `--allow-host HOST`, `--blocked FILE` (the stop note, default `<cache>/blocked.json`;
 `node relay.js --check-blocked FILE` exits 1 while an entry is in force).
@@ -192,4 +217,6 @@ files (about 280 MB) per run — the next run fills the rest. The last days' par
 run's cache, the NAT archive files (about two a day, small, not cached), one FAA list per day, the FAA
 advisories issued since the last run and at most one new GFS analysis. Without a cache, measured for three
 days on 12 Oct 2026: 115 requests and 18 MB (the OurAirports file is 12.7 MB and is read only when an airport
-with a weather program is not placed yet).
+with a weather program is not placed yet). The contrail parts (2026-10-21) read the GFS 0.5° temperature and
+humidity fields of three levels: about 4 files for the week ahead (+0 to +72 h) and, with the cache, at most one
+new 12Z analysis per run (about 1 MB a file). Whole-run time limit: 2735 s, under the job's 60 min.

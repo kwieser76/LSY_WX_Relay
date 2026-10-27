@@ -3,10 +3,11 @@
 # the repository does not grow):
 #   https://raw.githubusercontent.com/<owner>/<repo>/data/latest.json
 # The same commit carries cache/lightning-<week>.json and cache/mrms-<week>.json (the hours of lightning and
-# radar data already read this week) and cache/gfs.json and cache/faa.json (the GFS analyses and the FAA advisory
-# pages of the last days already read), so the next run downloads only what is new. The run restores them from
-# the data branch first; a missing or broken cache only means starting fresh, and a new week's run publishes no
-# cache of the old week (gfs.json and faa.json keep only the days of the current window).
+# radar data already read this week) and cache/gfs.json, cache/faa.json, cache/sigwx.json and cache/contrails.json
+# (the GFS analyses, the FAA advisory pages, the SIGWX charts and the contrail classes of the last days already read),
+# so the next run downloads only what is new. The run restores them from the data branch first; a missing or broken
+# cache only means starting fresh, and a new week's run publishes no cache of the old week (the per-day caches keep
+# only the days of the current window).
 # relay.js exits 1 without writing when every part failed or the privacy check finds something; the
 # publish step then does not run and the previous latest.json and caches stay in place.
 # Stop note (2026-10-13): a host that answered HTTP 403/429 is written to cache/blocked.json and not contacted for 24 h by
@@ -75,7 +76,8 @@ jobs:
     if: needs.gate.outputs.run == 'true'
     runs-on: ubuntu-latest
     # 60, not 40 (2026-10-12): the This-week parts (since.nat/gfs/faa) raised the worst case to ~38 min; a public repo
-    # pays nothing for minutes, and a run killed at the limit publishes nothing at all.
+    # pays nothing for minutes, and a run killed at the limit publishes nothing at all. With since.sigwx (2026-10-13) and
+    # the contrails parts (2026-10-21) relay.js's own whole-run limit is 2735 s (45.6 min), still under this timeout.
     timeout-minutes: 60
     steps:
       - name: Check out main

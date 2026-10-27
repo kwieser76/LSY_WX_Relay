@@ -9,7 +9,7 @@
 //   node relay.js [--out DIR] [--cache DIR] [--parts wxoutlook,sigwx,…,nat,since] [--deny-file FILE] [--allow-host HOST] [--blocked FILE]
 //   node relay.js --check-blocked FILE      exit 1 while the stop note FILE holds an entry in force (the workflow's last step)
 //
-// Seven parts, run one after another (so two parts never hit the same server at the same time), each with
+// Eight parts, run one after another (so two parts never hit the same server at the same time), each with
 // its own time limit. A part that fails or runs out of time becomes null with its error in status; the
 // others are still written. Only when every part failed, or the privacy check finds something, does the
 // run exit 1 without writing — the published file then stays as it was.
@@ -17,10 +17,13 @@
 //               (scripts/fetch-wxoutlook.js with an empty hub list: no airport values at all)
 //   sigwx       official WAFS SIGWX charts of the newest run, 12Z, up to T+48 (ahead charts only)
 //   sigwxModel  model-derived SIGWX from GFS, the 7 days ahead (jets, tropopause; CAT and CB to +72 h)
+//   contrails   model-derived contrail potential from GFS temperature and humidity (Schmidt-Appleman criterion plus
+//               near ice saturation) at FL300/340/390, the 7 days ahead, classes to +72 h (2026-10-21,
+//               scripts/fetch-contrails.js fetchContrails; the physics in scripts/contrail-diag.js)
 //   gefscat     ensemble CAT probability from GEFS, days 3–7 ahead
 //   dust        GEFS-Aerosols dust optical depth classes, 5 days (no airport values)
 //   nat         today's North Atlantic track message (FAA NOTAM system, scripts/nat-message.js)
-//   since       the observed weather of the current ISO week so far, Monday 00Z … now, in seven sub-parts:
+//   since       the observed weather of the current ISO week so far, Monday 00Z … now, in eight sub-parts:
 //               wxreview  US convective SIGMETs (IEM archive) and SPC storm reports — nothing international,
 //                         no pilot reports, no airport observations (scripts/fetch-wxreview.js fetchUsObserved)
 //               lightning EUMETSAT MTG Lightning Imager, hours with lightning per 0.5° cell (Europe/NAT, Middle East)
@@ -36,14 +39,17 @@
 //               sigwx     SIGWX of every day at 12Z: { official, model } — the official WAFS chart (06Z run +6 h first,
 //                         scripts/fetch-sigwx.js fetchSigwxObserved) and the model-derived picture from the GFS 12Z
 //                         analysis (scripts/fetch-sigwx-model.js fetchSigwxModelObserved); each null when it failed
+//               and, from 2026-10-21, on the same window:
+//               contrails the contrail classes of every day from the GFS 12Z analysis, analysis days only
+//                         (scripts/fetch-contrails.js fetchContrailsObserved; today's forecast day stays in parts.contrails)
 // window = today (UTC) … today + 6: the forecast days start on the day of the run; since.window = Monday … today;
-// the window of nat, gfs, faa and sigwx (extWindowOf) = Monday … today, or today − 2 … today when that starts earlier, with
-// weekFrom (the Monday) and beforeWeek (the days before it).
+// the window of nat, gfs, faa, sigwx and contrails (extWindowOf) = Monday … today, or today − 2 … today when that starts
+// earlier, with weekFrom (the Monday) and beforeWeek (the days before it).
 //
 // Incremental: lightning (one frame per hour) and MRMS (one file per hour) are not downloaded again for hours an
 // earlier run of the same week already read; the GFS analyses and the FAA advisory pages of the window are not read
-// again either, nor the SIGWX charts of a day already read. --cache DIR holds lightning-<week>.json, mrms-<week>.json,
-// gfs.json, faa.json and sigwx.json from the previous run
+// again either, nor the SIGWX charts or the contrail classes of a day already read. --cache DIR holds lightning-<week>.json,
+// mrms-<week>.json, gfs.json, faa.json, sigwx.json and contrails.json from the previous run
 // (the workflow restores them from the data branch); a missing, corrupt or other-week cache means starting fresh. The
 // updated caches are written to <out>/cache/ next to latest.json and published with it.
 //
@@ -58,10 +64,11 @@
 // times a day. The workflow ends red while an entry is in force (--check-blocked), so a refusal is noticed.
 //
 // latest.json (schema "lsy-wx-relay/1"): { schema, generatedAt, relayRun {id, url}, window {from, to},
-// parts {wxoutlook, sigwx, sigwxModel, gefscat, dust, nat, since} (each the same structure as the fetcher's
-// weekly snapshot, or null; since = {window, wxreview, lightning, mrms}), status {<part>: {ok, error?, seconds,
-// requests, megabytes, hosts}, 'since.wxreview' …}, attribution [], disclaimer }. See README.md. The 2026-10-12 sub-parts
-// keep the schema name: a reader of lsy-wx-relay/1 that does not know them ignores them.
+// parts {wxoutlook, sigwx, sigwxModel, contrails, gefscat, dust, nat, since} (each the same structure as the fetcher's
+// weekly snapshot, or null; since = {window, wxreview, lightning, mrms, nat, gfs, faa, sigwx, contrails}), status {<part>:
+// {ok, error?, seconds, requests, megabytes, hosts}, 'since.wxreview' …}, attribution [], disclaimer }. See README.md. The
+// sub-parts added since 2026-10-12 and the contrails parts (2026-10-21) keep the schema name: a reader of lsy-wx-relay/1
+// that does not know them ignores them.
 // ---------------------------------------------------------------------------
 'use strict';
 
@@ -74,11 +81,15 @@ const SCRIPTS = path.join(__dirname, 'scripts');
 // The weather layer registry (scripts/wx-layers.js, 2026-10-20): the window rule of each part and the producer stamps.
 // Next to relay.js in the packaged copy; in the project (tests) it is the project's own scripts/.
 const LY = (() => { try { return require(path.join(SCRIPTS, 'wx-layers.js')); } catch (e) { return require(path.join(__dirname, '..', '..', 'scripts', 'wx-layers.js')); } })();
-const PART_KEYS = ['wxoutlook', 'sigwx', 'sigwxModel', 'gefscat', 'dust', 'nat', 'since'];
-const SINCE_KEYS = ['wxreview', 'lightning', 'mrms', 'nat', 'gfs', 'faa', 'sigwx'];
+const PART_KEYS = ['wxoutlook', 'sigwx', 'sigwxModel', 'contrails', 'gefscat', 'dust', 'nat', 'since'];
+const SINCE_KEYS = ['wxreview', 'lightning', 'mrms', 'nat', 'gfs', 'faa', 'sigwx', 'contrails'];
 // The sub-parts on the window of at least MIN_DAYS days (extWindowOf): the registry's layers with window 'ext3'
-// (nat, gfs, faa, sigwx; ADR-001 Q2 kept wxreview, lightning and mrms on Monday to now). And what faa must never carry.
+// (nat, gfs, faa, sigwx, contrails; ADR-001 Q2 kept wxreview, lightning and mrms on Monday to now). And what faa must never carry.
 const SINCE_EXT = SINCE_KEYS.filter(k => LY.sinceExt().includes(k));
+// Parts switched off on purpose (not run, not published). since.contrails: Kurt, 25 Oct 2026: the Sunday latest.json was
+// already 1,380,840 bytes without contrails (budget 1.3 MB), so This week shows no contrails until the relay is trimmed.
+// The page knows (WX_CTR_NOW_OFF in the weather block) and says so; remove the entry and that flag together.
+const OFF_PARTS = ['since.contrails'];
 // The producer stamp each part must carry ([path in the part, layer id]); null parts are not checked.
 const STAMPS = {
   wxoutlook: [['producer', 'wxoutlook']], sigwx: [['producer', 'sigwx-official']], sigwxModel: [['producer', 'sigwx-model']],
@@ -87,6 +98,8 @@ const STAMPS = {
   'since.lightning': [['producer', 'lightning']], 'since.mrms': [['producer', 'mrms']], 'since.nat': [['producer', 'nat-days']],
   'since.gfs': [['jet.producer', 'gfs-jet'], ['levels.producer', 'gfs-levels']], 'since.faa': [['producer', 'faa-restrictions']],
   'since.sigwx': [['official.producer', 'sigwx-official'], ['model.producer', 'sigwx-model']],
+  // 2026-10-21: the contrail layer, the same stamp on the week ahead and the analyses of the window.
+  contrails: [['producer', 'contrails']], 'since.contrails': [['producer', 'contrails']],
 };
 const MIN_DAYS = 3;
 const FAA_PRIVATE = ['faa', 'icao', 'code', 'name', 'iata'];
@@ -120,7 +133,8 @@ const ATTRIBUTION_SINCE = {
 };
 
 // Part limits (s). The fetchers stop starting requests well before (soft deadlines 90–240 s); the sum plus 60 s is
-// the whole run's limit (2265 s with the 2026-10-12 sub-parts), under the workflow's job timeout of 40 min.
+// the whole run's limit (2735 s = 45.6 min with the contrails parts of 2026-10-21: 1350 s week ahead, 1325 s since,
+// 60 s), under the workflow's job timeout of 60 min (wx-relay.yml timeout-minutes).
 const PARTS = {
   // 2026-10-13 (ADR-001 Q3): the ECMWF ENS hub probabilities as values at neutral grid points (scripts/ens-points.js: the
   // airports of the public METAR archive's rule, read from OurAirports each run, published as grid indices only); without
@@ -135,6 +149,9 @@ const PARTS = {
   } },
   sigwx: { limit: 240, run: w => req('fetch-sigwx.js').fetchSigwx({ from: w.from, to: w.to, aheadOnly: true }) },
   sigwxModel: { limit: 240, run: w => req('fetch-sigwx-model.js').fetchSigwxModel({ from: w.prev, to: w.prev, aheadOnly: true }) },
+  // 2026-10-21: the week ahead of the contrail layer (same frames and window rule as sigwxModel: from = to = yesterday,
+  // ahead only, so the forecast days start today; classes to +72 h, the later days without bands).
+  contrails: { limit: 150, run: w => req('fetch-contrails.js').fetchContrails({ from: w.prev, to: w.prev, aheadOnly: true }) },
   gefscat: { limit: 240, run: w => req('fetch-gefs-cat.js').fetchGefsCat({ to: w.prev }) },
   dust: { limit: 180, run: () => req('fetch-dust.js').fetchDust({ hubs: [] }) },
 };
@@ -156,6 +173,9 @@ const SINCE = {
   // 2026-10-13: SIGWX of each day, official and model side by side (two hosts: AWC, NOMADS/AWS). One cache file holds
   // both halves (cache/sigwx.json {kind, official, model}); a day read before is not read again (see the two fetchers).
   sigwx: { limit: 200, cache: true, weekly: false, run: (xw, cache) => fetchSigwxSince(xw, cache) },
+  // 2026-10-21: the contrail classes of each day from the GFS 12Z analysis (NOMADS/AWS, the same cycle as the model
+  // SIGWX of since.sigwx). One cache file cache/contrails.json; a day read before is not read again.
+  contrails: { limit: 120, cache: true, weekly: false, run: (xw, cache) => req('fetch-contrails.js').fetchContrailsObserved({ from: xw.from, to: xw.to, cache, softDeadlineS: 90 }) },
 };
 async function fetchSigwxSince(xw, cache) {
   const prev = cache && cache.prev && cache.prev.kind === 'sigwxSince' ? cache.prev : {};
@@ -178,7 +198,8 @@ PARTS.nat = { limit: 60, run: async () => {
   if (notes.length) live.notes = notes;
   return live;
 } };
-const ORDER = ['wxoutlook', 'sigwxModel', 'gefscat', 'dust', 'sigwx', 'nat', 'since'];
+// contrails right after sigwxModel: the two NOMADS parts run one after the other, never at the same time.
+const ORDER = ['wxoutlook', 'sigwxModel', 'contrails', 'gefscat', 'dust', 'sigwx', 'nat', 'since'];
 const req = f => require(path.join(SCRIPTS, f));
 
 const addDays = (ymd, n) => { const d = new Date(ymd + 'T00:00:00Z'); d.setUTCDate(d.getUTCDate() + n); return d.toISOString().slice(0, 10); };
@@ -333,6 +354,12 @@ function finishPart(key, s, win, generatedAt) {
     if (s.model) Object.keys(s.model.areas || {}).forEach(a => { const A = s.model.areas[a], n = (A.days || []).length;
       A.days = (A.days || []).filter(d => inW(d.date) && d.kind === 'analysis'); if (A.days.length !== n) emptied.push('sigwx.model.areas.' + a + '.days (outside the window or not an analysis)'); });
   }
+  if (key === 'since.contrails') {
+    // Only the analysis days of the window (today's forecast day stays in parts.contrails), as the model half of since.sigwx.
+    const inW = d => d >= win.from && d <= win.to;
+    Object.keys(s.areas || {}).forEach(a => { const A = s.areas[a], n = (A.days || []).length;
+      A.days = (A.days || []).filter(d => inW(d.date) && d.kind === 'analysis'); if (A.days.length !== n) emptied.push('contrails.areas.' + a + '.days (outside the window or not an analysis)'); });
+  }
   if (key === 'since.faa') {
     // Belt and braces: no airport code or name, no list of airports under a centre, no centre names.
     (s.airports || []).forEach((a, i) => FAA_PRIVATE.forEach(k => { if (a && k in a) { emptied.push('faa.airports[' + i + '].' + k); delete a[k]; } }));
@@ -351,9 +378,9 @@ function finishPart(key, s, win, generatedAt) {
     empty(s, 'days', 'sigwx.days (past charts)');
     if (s.worst && Object.keys(s.worst).length) { emptied.push('sigwx.worst'); s.worst = {}; }
   }
-  if (key === 'sigwxModel') Object.keys(s.areas || {}).forEach(a => {
+  if (key === 'sigwxModel' || key === 'contrails') Object.keys(s.areas || {}).forEach(a => {
     const d = s.areas[a].days || [], f = d.filter(x => x.kind === 'forecast');
-    if (f.length !== d.length) emptied.push('sigwxModel.areas.' + a + '.days (analysis ' + (d.length - f.length) + ')');
+    if (f.length !== d.length) emptied.push(key + '.areas.' + a + '.days (analysis ' + (d.length - f.length) + ')');
     s.areas[a].days = f;
   });
   // Belt and braces: no hubs/hubProb array with content anywhere in the part.
@@ -363,6 +390,34 @@ function finishPart(key, s, win, generatedAt) {
     Object.keys(v).forEach(k => { if ((k === 'hubs' || k === 'hubProb') && Array.isArray(v[k]) && v[k].length) { emptied.push(p + '.' + k + ' (' + v[k].length + ')'); v[k] = []; } else walk(v[k], p + '.' + k); });
   })(s, key);
   return emptied;
+}
+
+// Cells of a run-length string "v*n,v" (the contrail classes; as scripts/wx-shape.js rleCount, which is not packaged).
+// A string that is not run-length is -1, so a bad grid never passes by chance.
+function rleCount(s) {
+  if (typeof s !== 'string' || !/^\d+(\*\d+)?(,\d+(\*\d+)?)*$/.test(s)) return -1;
+  let n = 0;
+  for (const t of s.split(',')) { const p = t.split('*'); n += p[1] ? +p[1] : 1; }
+  return n;
+}
+// The contrail frames (parts.contrails: forecast days, parts.since.contrails: analysis days): the three frames with a
+// grid, every day of the kind asked for and inside [from, to], and every band's ctr string of exactly nlat × nlon cells
+// (a day beyond +72 h has no bands at all). Problems are pushed to P with the prefix given.
+function checkContrails(P, s, prefix, kind, from, to) {
+  const num = v => typeof v === 'number' && isFinite(v), ts = v => typeof v === 'string' && /^\d{4}-\d\d-\d\dT\d\d/.test(v);
+  ['na', 'atl', 'me'].forEach(a => { const A = s.areas && s.areas[a];
+    if (!A || !Array.isArray(A.days)) return P.push(prefix + '.areas.' + a + ' missing');
+    if (!(A.nlat > 0 && A.nlon > 0 && num(A.lat0) && num(A.lon0) && num(A.res))) return P.push(prefix + '.areas.' + a + ' grid missing');
+    A.days.forEach(d => {
+      if (d.kind !== kind || !ts(d.valid)) P.push(prefix + ' ' + a + ' ' + d.date + ' is not a' + (kind === 'analysis' ? 'n analysis' : ' forecast') + ' day with a valid time');
+      if (!(typeof d.date === 'string' && d.date >= from && d.date <= to)) P.push(prefix + ' ' + a + ' ' + d.date + ' outside the window');
+      if (d.bands != null) {
+        if (typeof d.bands !== 'object' || !Object.keys(d.bands).length) P.push(prefix + ' ' + a + ' ' + d.date + ': bands empty (leave the key out beyond +72 h)');
+        else Object.keys(d.bands).forEach(b => { const c = rleCount(d.bands[b] && d.bands[b].ctr);
+          if (c !== A.nlat * A.nlon) P.push(prefix + ' ' + a + ' ' + d.date + ' band ' + b + ': ctr has ' + c + ' cells, the grid ' + A.nlat * A.nlon); });
+      }
+    });
+  });
 }
 
 // The contract check: [problems]; warnings start with "warn:". An empty list = valid.
@@ -402,6 +457,8 @@ function validate(L) {
       if (!A || !Array.isArray(A.days)) P.push('sigwxModel.areas.' + a + ' missing');
       else A.days.forEach(d => { if (d.kind !== 'forecast') P.push('sigwxModel ' + a + ' ' + d.date + ' is not a forecast day'); if (d.date < w.from) P.push('sigwxModel ' + a + ' ' + d.date + ' before the window'); }); });
   }
+  // 2026-10-21: the contrail week ahead, forecast days of the window only (today's 12Z analysis belongs to since.contrails).
+  if (parts.contrails) checkContrails(P, parts.contrails, 'contrails', 'forecast', w.from, w.to);
   const gc = parts.gefscat;
   if (gc) {
     if (!Array.isArray(gc.days) || !gc.areas) P.push('gefscat days / areas missing');
@@ -464,6 +521,8 @@ function validate(L) {
         else if (!(A.nlat > 0 && A.nlon > 0 && num(A.lat0) && num(A.lon0) && num(A.res))) P.push('since.sigwx.model.areas.' + a + ' grid missing');
         else A.days.forEach(d => { if (!inX(d.date) || d.kind !== 'analysis' || !ts(d.valid) || !Array.isArray(d.jets)) P.push('since.sigwx.model ' + a + ' ' + d.date + ' must be an analysis day of its window with valid time and jets'); }); });
     }
+    // 2026-10-21: the contrail classes of the window, analysis days only, every ctr grid complete (as the page draws it).
+    if (si.contrails) checkContrails(P, si.contrails, 'since.contrails', 'analysis', xw.from, xw.to);
     if (!SINCE_KEYS.some(k => si[k])) P.push('since has no sub-part (null when all failed)');
     const r = si.wxreview;
     if (r) {
@@ -501,7 +560,7 @@ function assemble(win, generatedAt, results, env, sinceWin) {
   const runUrl = e.GITHUB_RUN_ID && e.GITHUB_REPOSITORY ? (e.GITHUB_SERVER_URL || 'https://github.com') + '/' + e.GITHUB_REPOSITORY + '/actions/runs/' + e.GITHUB_RUN_ID : null;
   const L = { schema: SCHEMA, generatedAt, relayRun: { id: e.GITHUB_RUN_ID || null, url: runUrl }, window: { from: win.from, to: win.to }, parts: {}, status: {},
               attribution: ATTRIBUTION.slice(), disclaimer: DISCLAIMER };
-  const statusOf = r => Object.assign({ ok: !!r.snap }, r.snap ? {} : { error: r.error || 'failed' },
+  const statusOf = r => Object.assign({ ok: !!r.snap }, r.snap ? {} : { error: r.error || 'failed' }, r.off ? { off: true } : {},
     { seconds: r.seconds || 0, requests: r.requests || 0, megabytes: r.megabytes || 0, hosts: r.hosts || {} },
     r.emptied && r.emptied.length ? { emptied: r.emptied } : {}, r.cache ? { cache: r.cache } : {});
   // since = its three sub-parts; null when none of them has data (or it was not run).
@@ -576,6 +635,7 @@ async function main(argv) {
     if (k !== 'since') { if (!only || only.includes(k)) await one(k, win, PARTS[k].limit, null, win); continue; }
     for (const sk of SINCE_KEYS) {
       if (only && !only.includes('since') && !only.includes('since.' + sk)) continue;
+      if (OFF_PARTS.includes('since.' + sk) && !(only && only.includes('since.' + sk))) { results['since.' + sk] = { error: 'switched off', off: true }; continue; }
       const def = SINCE[sk], w = SINCE_EXT.includes(sk) ? xw : sw;
       if (!def.cache) { await one('since.' + sk, w, def.limit, x => def.run(x), w); continue; }
       const ck = def.weekly === false ? null : sw.week;
@@ -635,7 +695,7 @@ function checkBlocked(file, nowMs) {
 }
 
 module.exports = { SCHEMA, PART_KEYS, SINCE_KEYS, SINCE_EXT, STAMPS, MIN_DAYS, BLOCK_HOURS, ATTRIBUTION, ATTRIBUTION_SINCE, DISCLAIMER, windowOf, sinceWindowOf, extWindowOf, isoWeekOf,
-                   finishPart, validate, assemble, loadCache, cacheName, installFetch, denyList, readBlocked, inForce, blockedNote, headerValues, checkBlocked, main };
+                   finishPart, validate, assemble, loadCache, cacheName, installFetch, denyList, readBlocked, inForce, blockedNote, headerValues, checkBlocked, main, rleCount, ORDER };
 if (require.main === module && process.argv[2] === '--check-blocked') process.exit(checkBlocked(process.argv[3]));
 if (require.main === module) {
   if (!fs.existsSync(path.join(SCRIPTS, 'fetch-util.js'))) {
