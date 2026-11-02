@@ -60,6 +60,8 @@
 'use strict';
 
 const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
 const U = require('./fetch-util.js');
 const L = require('./wx-layers.js');        // the weather layer registry: producer stamp (ADR-001)
 const PNG = require('./png-lite.js');
@@ -518,4 +520,24 @@ function digest(s) {
 module.exports = { WMS, LAYER, GRID, GRID_ME, FRAME, frameSize, unionUrl, boxUrl, PX_PER_CELL, FRAME_MINUTES, HOUR_ORDER, LI_BAND_V, LAYER_EXTENT, AREAS, PAGES,
                    rleEncode, rleDecode, westEdge, frameUrl, plannedFrames, scanAngles, onDisk, liCovered, coverageMask, litCells, areaOf, aggregate,
                    attributionFor, fetchLightning, digest, CACHE_VERSION, readCache, writeCache };
-if (require.main === module) U.main('fetch-lightning', 'lightning', fetchLightning, digest);
+// Weekly run (2026-10-29, Kurt): every run keeps the frames it read in data/lightning/frames-<week>.json, and a second
+// pass (--fill, run-briefing.sh after the other pre-fetches, about 20 min later) asks only the frames still missing,
+// through the incremental mode above. EUMETView was slow at the rehearsals of 20 and 29 Oct (13 and 2 of 168 frames
+// after three timeouts) and complete on the Monday in between. Without --fill the first pass starts from no frames.
+function framesPath(week) { return path.join(U.ROOT, 'data', 'lightning', 'frames-' + week + '.json'); }
+function missingOf(week) { const s = U.readSnapshot('lightning', week); return s && s.window && s.window.week === week && s.frames ? (s.frames.missing || 0) : null; }
+if (require.main === module) {
+  const c = U.cli(process.argv);
+  if (c.has('--missing')) { const n = c.week ? missingOf(c.week) : null; process.stdout.write((n == null ? 'none' : String(n)) + '\n'); process.exit(0); }
+  const fill = c.has('--fill');
+  const run = async o => {
+    let prev = null;
+    if (fill) { try { prev = JSON.parse(fs.readFileSync(framesPath(o.week), 'utf8')); } catch (e) { prev = null; } }
+    const cache = { prev };
+    const s = await fetchLightning(Object.assign({}, o, { cache }));
+    if (cache.next) { fs.mkdirSync(path.dirname(framesPath(o.week)), { recursive: true }); fs.writeFileSync(framesPath(o.week), JSON.stringify(cache.next)); }
+    if (fill && cache.info) s.notes = (s.notes || []).concat(['second pass: ' + cache.info.reused + ' frames kept from the first pass, ' + cache.info.fetched + ' asked again' + (cache.info.dropped ? ' (first-pass frames not usable: ' + cache.info.dropped + ')' : '')]);
+    return s;
+  };
+  U.main('fetch-lightning', 'lightning', run, digest);
+}
